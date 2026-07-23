@@ -32,6 +32,105 @@ Resume text:
 """
 
 
+JOB_MATCH_PROMPT = """You are an ATS matching engine comparing a candidate's resume against a specific job description.
+
+Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
+{{
+  "match_score": <integer 0-100, how well the resume matches THIS job specifically>,
+  "matching_skills": [<skills/experience from the resume that align with this job>],
+  "missing_skills": [<required skills/experience from the job description NOT found in the resume>],
+  "recommendation": "<2-3 sentence assessment of fit, and what to add/change to improve the match>"
+}}
+
+Job description:
+---
+{job_description}
+---
+
+Resume text:
+---
+{resume_text}
+---
+"""
+
+
+RESUME_TAILOR_PROMPT = """You are an expert resume writer helping a college student tailor their resume for a specific job.
+
+Rewrite and improve the resume below so it better fits the target job description. Keep it truthful — do NOT invent
+experience, skills, projects, or qualifications the candidate doesn't have. Instead: reorder content to prioritize
+relevant experience, rephrase bullet points to use language/keywords from the job description where honestly applicable,
+tighten weak phrasing, and quantify achievements where the original already implies a metric.
+
+Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
+{{
+  "tailored_resume_text": "<the full rewritten resume as plain text, preserving section structure like Education, Skills, Projects, Certifications>",
+  "changes_summary": [<up to 6 short strings describing what was changed and why, e.g. 'Moved Python projects above certifications since the role prioritizes technical work'>]
+}}
+
+Job description (target role):
+---
+{job_description}
+---
+
+Original resume text:
+---
+{resume_text}
+---
+"""
+
+
+def tailor_resume_for_job(resume_text: str, job_description: str) -> dict:
+    if not resume_text or not resume_text.strip():
+        raise ValueError("Resume text is empty, cannot tailor")
+    if not job_description or not job_description.strip():
+        raise ValueError("Job description is empty, cannot tailor")
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=RESUME_TAILOR_PROMPT.format(
+            job_description=job_description[:4000],
+            resume_text=resume_text[:8000],
+        ),
+    )
+
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
+
+
+def match_resume_to_job(resume_text: str, job_description: str) -> dict:
+    if not resume_text or not resume_text.strip():
+        raise ValueError("Resume text is empty, cannot match")
+    if not job_description or not job_description.strip():
+        raise ValueError("Job description is empty, cannot match")
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=JOB_MATCH_PROMPT.format(
+            job_description=job_description[:4000],
+            resume_text=resume_text[:8000],
+        ),
+    )
+
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
+
+
 def analyze_resume(resume_text: str) -> dict:
     if not resume_text or not resume_text.strip():
         raise ValueError("Resume text is empty, cannot analyze")

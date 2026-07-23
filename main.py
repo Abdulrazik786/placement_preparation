@@ -12,7 +12,7 @@ from pypdf import PdfReader
 import models
 from database import engine, get_db
 from auth import hash_password, verify_password, create_access_token, decode_access_token
-from ai_service import analyze_resume
+from ai_service import analyze_resume, match_resume_to_job, tailor_resume_for_job
 
 # Folder where uploaded resume files get saved
 UPLOAD_DIR = "uploaded_resumes"
@@ -90,6 +90,42 @@ class ResumeAnalysisOut(BaseModel):
     keyword_suggestions: List[str]
     formatting_issues: List[str]
     summary: str
+
+
+class JobPostingCreate(BaseModel):
+    title: str
+    company_name: str
+    description: str
+    required_skills: List[str] = []
+
+
+class JobPostingOut(BaseModel):
+    id: int
+    title: str
+    company_name: str
+    description: str
+    required_skills: List[str]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class JobMatchOut(BaseModel):
+    match_score: int
+    matching_skills: List[str]
+    missing_skills: List[str]
+    recommendation: str
+
+
+class TailoredResumeOut(BaseModel):
+    id: int
+    tailored_text: str
+    changes_summary: List[str]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class EligibilityResult(BaseModel):
@@ -295,6 +331,122 @@ def analyze_my_resume(
         raise HTTPException(status_code=502, detail=f"AI analysis failed: {str(e)}")
 
     return result
+
+
+@app.post("/jobs", response_model=JobPostingOut)
+def create_job(job: JobPostingCreate, db: Session = Depends(get_db)):
+    # NOTE: same as /companies, no admin-only restriction yet - fine for local testing
+    new_job = models.JobPosting(
+        title=job.title,
+        company_name=job.company_name,
+        description=job.description,
+        required_skills=job.required_skills,
+    )
+    db.add(new_job)
+    db.commit()
+    db.refresh(new_job)
+    return new_job
+
+
+@app.get("/jobs", response_model=List[JobPostingOut])
+def list_jobs(db: Session = Depends(get_db)):
+    return db.query(models.JobPosting).order_by(models.JobPosting.created_at.desc()).all()
+
+
+@app.post("/resumes/{resume_id}/match/{job_id}", response_model=JobMatchOut)
+def match_resume_to_job_posting(
+    resume_id: int,
+    job_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resume = (
+        db.query(models.Resume)
+        .filter(models.Resume.id == resume_id, models.Resume.user_id == current_user.id)
+        .first()
+    )
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+    if not resume.extracted_text:
+        raise HTTPException(status_code=400, detail="No text could be extracted from this resume")
+
+    job = db.query(models.JobPosting).filter(models.JobPosting.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job posting not found")
+
+    try:
+        result = match_resume_to_job(resume.extracted_text, job.description)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"AI matching failed: {str(e)}")
+
+    return result
+
+
+@app.post("/resumes/{resume_id}/tailor/{job_id}", response_model=TailoredResumeOut)
+def tailor_my_resume(
+    resume_id: int,
+    job_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resume = (
+        db.query(models.Resume)
+        .filter(models.Resume.id == resume_id, models.Resume.user_id == current_user.id)
+        .first()
+    )
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+    if not resume.extracted_text:
+        raise HTTPException(status_code=400, detail="No text could be extracted from this resume")
+
+    job = db.query(models.JobPosting).filter(models.JobPosting.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job posting not found")
+
+    try:
+        result = tailor_resume_for_job(resume.extracted_text, job.description)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"AI tailoring failed: {str(e)}")
+
+    new_tailored = models.TailoredResume(
+        user_id=current_user.id,
+        original_resume_id=resume.id,
+        job_posting_id=job.id,
+        tailored_text=result["tailored_resume_text"],
+        changes_summary=result["changes_summary"],
+    )
+    db.add(new_tailored)
+    db.commit()
+    db.refresh(new_tailored)
+
+    return TailoredResumeOut(
+        id=new_tailored.id,
+        tailored_text=new_tailored.tailored_text,
+        changes_summary=new_tailored.changes_summary,
+        created_at=new_tailored.created_at,
+    )
+
+
+@app.get("/tailored-resumes", response_model=List[TailoredResumeOut])
+def list_my_tailored_resumes(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    results = (
+        db.query(models.TailoredResume)
+        .filter(models.TailoredResume.user_id == current_user.id)
+        .order_by(models.TailoredResume.created_at.desc())
+        .all()
+    )
+    return [
+        TailoredResumeOut(
+            id=r.id,
+            tailored_text=r.tailored_text,
+            changes_summary=r.changes_summary,
+            created_at=r.created_at,
+        )
+        for r in results
+    ]
 
 
 @app.get("/eligibility", response_model=List[EligibilityResult])

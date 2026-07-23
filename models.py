@@ -58,6 +58,31 @@ class Resume(Base):
     user = relationship("User")
 
 
+class JobPosting(Base):
+    __tablename__ = "job_postings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)          # e.g. "Software Engineer Intern"
+    company_name = Column(String, nullable=False)
+    description = Column(String, nullable=False)     # full job description text
+    required_skills = Column(JSON, default=list)      # e.g. ["Python", "SQL", "REST APIs"]
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class TailoredResume(Base):
+    __tablename__ = "tailored_resumes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    original_resume_id = Column(Integer, ForeignKey("resumes.id"), nullable=False)
+    job_posting_id = Column(Integer, ForeignKey("job_postings.id"), nullable=False)
+    tailored_text = Column(String, nullable=False)     # the rewritten resume content
+    changes_summary = Column(JSON, default=list)         # list of what was changed/why
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+
+
 class DailyStudyPlan(Base):
     __tablename__ = "daily_study_plans"
 

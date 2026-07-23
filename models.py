@@ -83,6 +83,34 @@ class TailoredResume(Base):
     user = relationship("User")
 
 
+class CodingProblem(Base):
+    __tablename__ = "coding_problems"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)
+    description = Column(String, nullable=False)
+    difficulty = Column(String, nullable=False)     # "easy", "medium", "hard"
+    topic = Column(String, nullable=False)            # e.g. "arrays", "dynamic programming"
+    examples = Column(JSON, default=list)              # list of {input, output, explanation}
+    constraints = Column(JSON, default=list)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CodingSubmission(Base):
+    __tablename__ = "coding_submissions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    problem_id = Column(Integer, ForeignKey("coding_problems.id"), nullable=False)
+    code = Column(String, nullable=False)
+    language = Column(String, nullable=False)
+    correctness_score = Column(Integer, nullable=True)   # 0-100
+    feedback = Column(JSON, default=dict)                  # full AI evaluation
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+
+
 class DailyStudyPlan(Base):
     __tablename__ = "daily_study_plans"
 

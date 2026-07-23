@@ -12,7 +12,13 @@ from pypdf import PdfReader
 import models
 from database import engine, get_db
 from auth import hash_password, verify_password, create_access_token, decode_access_token
-from ai_service import analyze_resume, match_resume_to_job, tailor_resume_for_job
+from ai_service import (
+    analyze_resume,
+    match_resume_to_job,
+    tailor_resume_for_job,
+    generate_coding_problem,
+    evaluate_code_submission,
+)
 
 # Folder where uploaded resume files get saved
 UPLOAD_DIR = "uploaded_resumes"
@@ -126,6 +132,39 @@ class TailoredResumeOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class CodingProblemRequest(BaseModel):
+    topic: str = "arrays"
+    difficulty: str = "easy"  # "easy", "medium", "hard"
+
+
+class CodingProblemOut(BaseModel):
+    id: int
+    title: str
+    description: str
+    difficulty: str
+    topic: str
+    examples: List[dict]
+    constraints: List[str]
+
+    class Config:
+        from_attributes = True
+
+
+class CodeSubmissionRequest(BaseModel):
+    code: str
+    language: str = "python"
+
+
+class CodeEvaluationOut(BaseModel):
+    correctness_score: int
+    time_complexity: str
+    space_complexity: str
+    bugs_or_edge_cases_missed: List[str]
+    code_quality_notes: List[str]
+    suggestions: List[str]
+    overall_feedback: str
 
 
 class EligibilityResult(BaseModel):
@@ -447,6 +486,67 @@ def list_my_tailored_resumes(
         )
         for r in results
     ]
+
+
+@app.post("/coding/problems/generate", response_model=CodingProblemOut)
+def generate_problem(
+    request: CodingProblemRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        result = generate_coding_problem(request.topic, request.difficulty)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"AI problem generation failed: {str(e)}")
+
+    new_problem = models.CodingProblem(
+        title=result["title"],
+        description=result["description"],
+        difficulty=request.difficulty,
+        topic=request.topic,
+        examples=result.get("examples", []),
+        constraints=result.get("constraints", []),
+    )
+    db.add(new_problem)
+    db.commit()
+    db.refresh(new_problem)
+    return new_problem
+
+
+@app.get("/coding/problems", response_model=List[CodingProblemOut])
+def list_problems(db: Session = Depends(get_db)):
+    return db.query(models.CodingProblem).order_by(models.CodingProblem.created_at.desc()).all()
+
+
+@app.post("/coding/problems/{problem_id}/submit", response_model=CodeEvaluationOut)
+def submit_solution(
+    problem_id: int,
+    submission: CodeSubmissionRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    problem = db.query(models.CodingProblem).filter(models.CodingProblem.id == problem_id).first()
+    if not problem:
+        raise HTTPException(status_code=404, detail="Problem not found")
+
+    try:
+        evaluation = evaluate_code_submission(problem.description, submission.code, submission.language)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"AI evaluation failed: {str(e)}")
+
+    new_submission = models.CodingSubmission(
+        user_id=current_user.id,
+        problem_id=problem.id,
+        code=submission.code,
+        language=submission.language,
+        correctness_score=evaluation.get("correctness_score"),
+        feedback=evaluation,
+    )
+    db.add(new_submission)
+    db.commit()
+    db.refresh(new_submission)
+
+    return evaluation
 
 
 @app.get("/eligibility", response_model=List[EligibilityResult])

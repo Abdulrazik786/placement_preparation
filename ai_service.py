@@ -79,6 +79,89 @@ Original resume text:
 """
 
 
+CODING_PROBLEM_PROMPT = """You are creating a coding interview practice problem for a college student preparing for placements.
+
+Generate ONE original coding problem on the topic "{topic}" at "{difficulty}" difficulty.
+
+Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
+{{
+  "title": "<short problem title>",
+  "description": "<full problem statement, clear and unambiguous>",
+  "examples": [
+    {{"input": "<example input>", "output": "<expected output>", "explanation": "<brief why>"}}
+  ],
+  "constraints": ["<constraint 1>", "<constraint 2>"]
+}}
+
+Provide 2-3 examples. Keep it realistic to what companies like TCS, Infosys, Amazon, or similar actually ask in coding rounds.
+"""
+
+CODE_EVALUATION_PROMPT = """You are a coding interview evaluator.
+
+Problem:
+---
+{problem_description}
+---
+
+Candidate's solution (language: {language}):
+---
+{code}
+---
+
+Evaluate the solution. Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
+{{
+  "correctness_score": <integer 0-100, how likely this solves the problem correctly across edge cases>,
+  "time_complexity": "<Big-O estimate, e.g. O(n log n)>",
+  "space_complexity": "<Big-O estimate, e.g. O(n)>",
+  "bugs_or_edge_cases_missed": [<up to 4 short strings, empty list if none found>],
+  "code_quality_notes": [<up to 3 short strings on readability/naming/structure>],
+  "suggestions": [<up to 3 short strings on how to improve>],
+  "overall_feedback": "<2-3 sentence summary>"
+}}
+"""
+
+
+def generate_coding_problem(topic: str, difficulty: str) -> dict:
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=CODING_PROBLEM_PROMPT.format(topic=topic, difficulty=difficulty),
+    )
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
+
+
+def evaluate_code_submission(problem_description: str, code: str, language: str) -> dict:
+    if not code or not code.strip():
+        raise ValueError("Code is empty, cannot evaluate")
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=CODE_EVALUATION_PROMPT.format(
+            problem_description=problem_description[:3000],
+            code=code[:6000],
+            language=language,
+        ),
+    )
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
+
+
 def tailor_resume_for_job(resume_text: str, job_description: str) -> dict:
     if not resume_text or not resume_text.strip():
         raise ValueError("Resume text is empty, cannot tailor")

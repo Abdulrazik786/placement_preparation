@@ -111,6 +111,33 @@ class CodingSubmission(Base):
     user = relationship("User")
 
 
+class AptitudeQuestion(Base):
+    __tablename__ = "aptitude_questions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    topic = Column(String, nullable=False)          # e.g. "percentages", "logical reasoning"
+    difficulty = Column(String, nullable=False)      # "easy", "medium", "hard"
+    question_text = Column(String, nullable=False)
+    options = Column(JSON, default=list)              # e.g. ["12", "15", "18", "20"]
+    correct_answer = Column(String, nullable=False)   # kept hidden from list/generate responses
+    explanation = Column(String, nullable=False)      # kept hidden until the student answers
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AptitudeAttempt(Base):
+    __tablename__ = "aptitude_attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    question_id = Column(Integer, ForeignKey("aptitude_questions.id"), nullable=False)
+    selected_answer = Column(String, nullable=False)
+    is_correct = Column(Integer, nullable=False)  # stored as 0/1 for SQLite simplicity
+    personalized_explanation = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+
+
 class DailyStudyPlan(Base):
     __tablename__ = "daily_study_plans"
 

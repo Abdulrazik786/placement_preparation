@@ -121,6 +121,83 @@ Evaluate the solution. Return ONLY a JSON object (no markdown, no preamble, no c
 """
 
 
+APTITUDE_QUESTION_PROMPT = """You are creating an aptitude practice question for a college student preparing for placement exams
+(like TCS NQT, Infosys, Amazon aptitude rounds).
+
+Generate ONE multiple-choice question on the topic "{topic}" at "{difficulty}" difficulty.
+
+Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
+{{
+  "question_text": "<the question>",
+  "options": ["<option A>", "<option B>", "<option C>", "<option D>"],
+  "correct_answer": "<must exactly match one of the options above>",
+  "explanation": "<step-by-step explanation of how to solve it>"
+}}
+"""
+
+APTITUDE_PERSONALIZED_EXPLANATION_PROMPT = """A student answered an aptitude practice question.
+
+Question: {question_text}
+Options: {options}
+Correct answer: {correct_answer}
+Student's answer: {selected_answer}
+Standard explanation: {explanation}
+
+Write a short, encouraging, personalized explanation (3-5 sentences) for THIS student based on what they chose.
+If they got it right, briefly confirm why and reinforce the concept.
+If they got it wrong, gently explain the mistake they likely made (based on their chosen option) and clarify the correct reasoning.
+
+Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
+{{
+  "personalized_explanation": "<the explanation text>"
+}}
+"""
+
+
+def generate_aptitude_question(topic: str, difficulty: str) -> dict:
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=APTITUDE_QUESTION_PROMPT.format(topic=topic, difficulty=difficulty),
+    )
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
+
+
+def generate_personalized_explanation(
+    question_text: str, options: list, correct_answer: str, selected_answer: str, explanation: str
+) -> str:
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=APTITUDE_PERSONALIZED_EXPLANATION_PROMPT.format(
+            question_text=question_text,
+            options=options,
+            correct_answer=correct_answer,
+            selected_answer=selected_answer,
+            explanation=explanation,
+        ),
+    )
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        parsed = json.loads(raw_text)
+        return parsed["personalized_explanation"]
+    except (json.JSONDecodeError, KeyError):
+        # fall back to the standard explanation if the personalized call fails to parse
+        return explanation
+
+
 def generate_coding_problem(topic: str, difficulty: str) -> dict:
     response = client.models.generate_content(
         model=MODEL_NAME,

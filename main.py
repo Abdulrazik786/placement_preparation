@@ -18,6 +18,8 @@ from ai_service import (
     tailor_resume_for_job,
     generate_coding_problem,
     evaluate_code_submission,
+    generate_aptitude_question,
+    generate_personalized_explanation,
 )
 
 # Folder where uploaded resume files get saved
@@ -165,6 +167,33 @@ class CodeEvaluationOut(BaseModel):
     code_quality_notes: List[str]
     suggestions: List[str]
     overall_feedback: str
+
+
+class AptitudeQuestionRequest(BaseModel):
+    topic: str = "percentages"
+    difficulty: str = "easy"
+
+
+class AptitudeQuestionOut(BaseModel):
+    id: int
+    topic: str
+    difficulty: str
+    question_text: str
+    options: List[str]
+    # NOTE: correct_answer and explanation deliberately excluded here so students can't see the answer upfront
+
+    class Config:
+        from_attributes = True
+
+
+class AptitudeAnswerRequest(BaseModel):
+    selected_answer: str
+
+
+class AptitudeAnswerResult(BaseModel):
+    is_correct: bool
+    correct_answer: str
+    personalized_explanation: str
 
 
 class EligibilityResult(BaseModel):
@@ -547,6 +576,74 @@ def submit_solution(
     db.refresh(new_submission)
 
     return evaluation
+
+
+@app.post("/aptitude/questions/generate", response_model=AptitudeQuestionOut)
+def generate_aptitude_q(
+    request: AptitudeQuestionRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        result = generate_aptitude_question(request.topic, request.difficulty)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"AI question generation failed: {str(e)}")
+
+    new_question = models.AptitudeQuestion(
+        topic=request.topic,
+        difficulty=request.difficulty,
+        question_text=result["question_text"],
+        options=result["options"],
+        correct_answer=result["correct_answer"],
+        explanation=result["explanation"],
+    )
+    db.add(new_question)
+    db.commit()
+    db.refresh(new_question)
+    return new_question
+
+
+@app.get("/aptitude/questions", response_model=List[AptitudeQuestionOut])
+def list_aptitude_questions(db: Session = Depends(get_db)):
+    return db.query(models.AptitudeQuestion).order_by(models.AptitudeQuestion.created_at.desc()).all()
+
+
+@app.post("/aptitude/questions/{question_id}/answer", response_model=AptitudeAnswerResult)
+def answer_aptitude_question(
+    question_id: int,
+    answer: AptitudeAnswerRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    question = db.query(models.AptitudeQuestion).filter(models.AptitudeQuestion.id == question_id).first()
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    is_correct = answer.selected_answer.strip() == question.correct_answer.strip()
+
+    personalized_explanation = generate_personalized_explanation(
+        question_text=question.question_text,
+        options=question.options,
+        correct_answer=question.correct_answer,
+        selected_answer=answer.selected_answer,
+        explanation=question.explanation,
+    )
+
+    attempt = models.AptitudeAttempt(
+        user_id=current_user.id,
+        question_id=question.id,
+        selected_answer=answer.selected_answer,
+        is_correct=1 if is_correct else 0,
+        personalized_explanation=personalized_explanation,
+    )
+    db.add(attempt)
+    db.commit()
+
+    return AptitudeAnswerResult(
+        is_correct=is_correct,
+        correct_answer=question.correct_answer,
+        personalized_explanation=personalized_explanation,
+    )
 
 
 @app.get("/eligibility", response_model=List[EligibilityResult])

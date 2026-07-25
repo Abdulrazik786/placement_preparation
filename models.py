@@ -30,6 +30,13 @@ class User(Base):
     cgpa = Column(Float, nullable=True)
     backlogs = Column(Integer, default=0)
 
+    # --- Master profile fields: this is what makes interview questions and skill-gap analysis personalized ---
+    skills = Column(JSON, default=list)          # e.g. ["Python", "SQL", "Git"]
+    projects = Column(JSON, default=list)          # e.g. [{"title": ..., "description": ..., "tech_stack": [...]}]
+    certifications = Column(JSON, default=list)    # e.g. [{"name": ..., "issuer": ..., "year": ...}]
+    internships = Column(JSON, default=list)        # e.g. [{"role": ..., "company": ..., "duration": ..., "description": ...}]
+    career_interest = Column(String, nullable=True)  # e.g. "Machine Learning Engineer"
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     daily_plans = relationship("DailyStudyPlan", back_populates="user")
@@ -78,61 +85,6 @@ class TailoredResume(Base):
     job_posting_id = Column(Integer, ForeignKey("job_postings.id"), nullable=False)
     tailored_text = Column(String, nullable=False)     # the rewritten resume content
     changes_summary = Column(JSON, default=list)         # list of what was changed/why
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    user = relationship("User")
-
-
-class CodingProblem(Base):
-    __tablename__ = "coding_problems"
-
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String, nullable=False)
-    description = Column(String, nullable=False)
-    difficulty = Column(String, nullable=False)     # "easy", "medium", "hard"
-    topic = Column(String, nullable=False)            # e.g. "arrays", "dynamic programming"
-    examples = Column(JSON, default=list)              # list of {input, output, explanation}
-    constraints = Column(JSON, default=list)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-
-class CodingSubmission(Base):
-    __tablename__ = "coding_submissions"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    problem_id = Column(Integer, ForeignKey("coding_problems.id"), nullable=False)
-    code = Column(String, nullable=False)
-    language = Column(String, nullable=False)
-    correctness_score = Column(Integer, nullable=True)   # 0-100
-    feedback = Column(JSON, default=dict)                  # full AI evaluation
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    user = relationship("User")
-
-
-class AptitudeQuestion(Base):
-    __tablename__ = "aptitude_questions"
-
-    id = Column(Integer, primary_key=True, index=True)
-    topic = Column(String, nullable=False)          # e.g. "percentages", "logical reasoning"
-    difficulty = Column(String, nullable=False)      # "easy", "medium", "hard"
-    question_text = Column(String, nullable=False)
-    options = Column(JSON, default=list)              # e.g. ["12", "15", "18", "20"]
-    correct_answer = Column(String, nullable=False)   # kept hidden from list/generate responses
-    explanation = Column(String, nullable=False)      # kept hidden until the student answers
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-
-class AptitudeAttempt(Base):
-    __tablename__ = "aptitude_attempts"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    question_id = Column(Integer, ForeignKey("aptitude_questions.id"), nullable=False)
-    selected_answer = Column(String, nullable=False)
-    is_correct = Column(Integer, nullable=False)  # stored as 0/1 for SQLite simplicity
-    personalized_explanation = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User")

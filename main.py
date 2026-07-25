@@ -12,15 +12,7 @@ from pypdf import PdfReader
 import models
 from database import engine, get_db
 from auth import hash_password, verify_password, create_access_token, decode_access_token
-from ai_service import (
-    analyze_resume,
-    match_resume_to_job,
-    tailor_resume_for_job,
-    generate_coding_problem,
-    evaluate_code_submission,
-    generate_aptitude_question,
-    generate_personalized_explanation,
-)
+from ai_service import analyze_resume, match_resume_to_job, tailor_resume_for_job
 
 # Folder where uploaded resume files get saved
 UPLOAD_DIR = "uploaded_resumes"
@@ -45,6 +37,34 @@ class UserCreate(BaseModel):
     cgpa: Optional[float] = None
 
 
+class ProjectItem(BaseModel):
+    title: str
+    description: str
+    tech_stack: List[str] = []
+
+
+class CertificationItem(BaseModel):
+    name: str
+    issuer: Optional[str] = None
+    year: Optional[int] = None
+
+
+class InternshipItem(BaseModel):
+    role: str
+    company: str
+    duration: Optional[str] = None
+    description: Optional[str] = None
+
+
+class ProfileUpdate(BaseModel):
+    # All optional - student can update just one part of their profile at a time
+    skills: Optional[List[str]] = None
+    projects: Optional[List[ProjectItem]] = None
+    certifications: Optional[List[CertificationItem]] = None
+    internships: Optional[List[InternshipItem]] = None
+    career_interest: Optional[str] = None
+
+
 class UserOut(BaseModel):
     id: int
     email: str
@@ -52,6 +72,11 @@ class UserOut(BaseModel):
     branch: Optional[str]
     graduation_year: Optional[int]
     cgpa: Optional[float]
+    skills: List[str]
+    projects: List[dict]
+    certifications: List[dict]
+    internships: List[dict]
+    career_interest: Optional[str]
 
     class Config:
         from_attributes = True
@@ -136,66 +161,6 @@ class TailoredResumeOut(BaseModel):
         from_attributes = True
 
 
-class CodingProblemRequest(BaseModel):
-    topic: str = "arrays"
-    difficulty: str = "easy"  # "easy", "medium", "hard"
-
-
-class CodingProblemOut(BaseModel):
-    id: int
-    title: str
-    description: str
-    difficulty: str
-    topic: str
-    examples: List[dict]
-    constraints: List[str]
-
-    class Config:
-        from_attributes = True
-
-
-class CodeSubmissionRequest(BaseModel):
-    code: str
-    language: str = "python"
-
-
-class CodeEvaluationOut(BaseModel):
-    correctness_score: int
-    time_complexity: str
-    space_complexity: str
-    bugs_or_edge_cases_missed: List[str]
-    code_quality_notes: List[str]
-    suggestions: List[str]
-    overall_feedback: str
-
-
-class AptitudeQuestionRequest(BaseModel):
-    topic: str = "percentages"
-    difficulty: str = "easy"
-
-
-class AptitudeQuestionOut(BaseModel):
-    id: int
-    topic: str
-    difficulty: str
-    question_text: str
-    options: List[str]
-    # NOTE: correct_answer and explanation deliberately excluded here so students can't see the answer upfront
-
-    class Config:
-        from_attributes = True
-
-
-class AptitudeAnswerRequest(BaseModel):
-    selected_answer: str
-
-
-class AptitudeAnswerResult(BaseModel):
-    is_correct: bool
-    correct_answer: str
-    personalized_explanation: str
-
-
 class EligibilityResult(BaseModel):
     company: CompanyOut
     eligible: bool
@@ -241,6 +206,14 @@ def check_eligibility(user: models.User, company: models.Company) -> Eligibility
             reasons.append(f"Branch '{user.branch}' is not in the allowed list: {company.allowed_branches}")
 
     return EligibilityResult(company=company, eligible=(len(reasons) == 0), reasons=reasons)
+
+
+def extract_text_from_pdf(file_path: str) -> str:
+    reader = PdfReader(file_path)
+    text_parts = []
+    for page in reader.pages:
+        text_parts.append(page.extract_text() or "")
+    return "\n".join(text_parts)
 
 
 # ---- Routes ----
@@ -296,11 +269,33 @@ def read_current_user(current_user: models.User = Depends(get_current_user)):
     return current_user
 
 
+@app.put("/me/profile", response_model=UserOut)
+def update_my_profile(
+    profile: ProfileUpdate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    # Only overwrite fields that were actually provided - lets the student update
+    # e.g. just skills, without wiping out their existing projects
+    if profile.skills is not None:
+        current_user.skills = profile.skills
+    if profile.projects is not None:
+        current_user.projects = [p.dict() for p in profile.projects]
+    if profile.certifications is not None:
+        current_user.certifications = [c.dict() for c in profile.certifications]
+    if profile.internships is not None:
+        current_user.internships = [i.dict() for i in profile.internships]
+    if profile.career_interest is not None:
+        current_user.career_interest = profile.career_interest
+
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+
 # --- Company endpoints ---
 @app.post("/companies", response_model=CompanyOut)
 def create_company(company: CompanyCreate, db: Session = Depends(get_db)):
-    # NOTE: no admin-only restriction yet — anyone logged in (or even not) can add a company right now.
-    # We'll lock this down to admin-only once we add role checks; fine for local testing for now.
     existing = db.query(models.Company).filter(models.Company.name == company.name).first()
     if existing:
         raise HTTPException(status_code=400, detail="Company already exists")
@@ -322,15 +317,6 @@ def list_companies(db: Session = Depends(get_db)):
     return db.query(models.Company).all()
 
 
-# --- Eligibility checker ---
-def extract_text_from_pdf(file_path: str) -> str:
-    reader = PdfReader(file_path)
-    text_parts = []
-    for page in reader.pages:
-        text_parts.append(page.extract_text() or "")
-    return "\n".join(text_parts)
-
-
 # --- Resume endpoints ---
 @app.post("/resumes", response_model=ResumeOut)
 def upload_resume(
@@ -341,17 +327,15 @@ def upload_resume(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported right now")
 
-    # Save the file to disk with a unique name (user id + original filename, to avoid clashes)
     saved_filename = f"user{current_user.id}_{file.filename}"
     saved_path = os.path.join(UPLOAD_DIR, saved_filename)
     with open(saved_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Extract text right away so it's ready for the AI analysis step later
     try:
         extracted_text = extract_text_from_pdf(saved_path)
     except Exception:
-        extracted_text = None  # if extraction fails, we still keep the file; text can be retried later
+        extracted_text = None
 
     new_resume = models.Resume(
         user_id=current_user.id,
@@ -386,7 +370,6 @@ def analyze_my_resume(
     )
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
-
     if not resume.extracted_text:
         raise HTTPException(
             status_code=400,
@@ -403,7 +386,6 @@ def analyze_my_resume(
 
 @app.post("/jobs", response_model=JobPostingOut)
 def create_job(job: JobPostingCreate, db: Session = Depends(get_db)):
-    # NOTE: same as /companies, no admin-only restriction yet - fine for local testing
     new_job = models.JobPosting(
         title=job.title,
         company_name=job.company_name,
@@ -515,135 +497,6 @@ def list_my_tailored_resumes(
         )
         for r in results
     ]
-
-
-@app.post("/coding/problems/generate", response_model=CodingProblemOut)
-def generate_problem(
-    request: CodingProblemRequest,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    try:
-        result = generate_coding_problem(request.topic, request.difficulty)
-    except ValueError as e:
-        raise HTTPException(status_code=502, detail=f"AI problem generation failed: {str(e)}")
-
-    new_problem = models.CodingProblem(
-        title=result["title"],
-        description=result["description"],
-        difficulty=request.difficulty,
-        topic=request.topic,
-        examples=result.get("examples", []),
-        constraints=result.get("constraints", []),
-    )
-    db.add(new_problem)
-    db.commit()
-    db.refresh(new_problem)
-    return new_problem
-
-
-@app.get("/coding/problems", response_model=List[CodingProblemOut])
-def list_problems(db: Session = Depends(get_db)):
-    return db.query(models.CodingProblem).order_by(models.CodingProblem.created_at.desc()).all()
-
-
-@app.post("/coding/problems/{problem_id}/submit", response_model=CodeEvaluationOut)
-def submit_solution(
-    problem_id: int,
-    submission: CodeSubmissionRequest,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    problem = db.query(models.CodingProblem).filter(models.CodingProblem.id == problem_id).first()
-    if not problem:
-        raise HTTPException(status_code=404, detail="Problem not found")
-
-    try:
-        evaluation = evaluate_code_submission(problem.description, submission.code, submission.language)
-    except ValueError as e:
-        raise HTTPException(status_code=502, detail=f"AI evaluation failed: {str(e)}")
-
-    new_submission = models.CodingSubmission(
-        user_id=current_user.id,
-        problem_id=problem.id,
-        code=submission.code,
-        language=submission.language,
-        correctness_score=evaluation.get("correctness_score"),
-        feedback=evaluation,
-    )
-    db.add(new_submission)
-    db.commit()
-    db.refresh(new_submission)
-
-    return evaluation
-
-
-@app.post("/aptitude/questions/generate", response_model=AptitudeQuestionOut)
-def generate_aptitude_q(
-    request: AptitudeQuestionRequest,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    try:
-        result = generate_aptitude_question(request.topic, request.difficulty)
-    except ValueError as e:
-        raise HTTPException(status_code=502, detail=f"AI question generation failed: {str(e)}")
-
-    new_question = models.AptitudeQuestion(
-        topic=request.topic,
-        difficulty=request.difficulty,
-        question_text=result["question_text"],
-        options=result["options"],
-        correct_answer=result["correct_answer"],
-        explanation=result["explanation"],
-    )
-    db.add(new_question)
-    db.commit()
-    db.refresh(new_question)
-    return new_question
-
-
-@app.get("/aptitude/questions", response_model=List[AptitudeQuestionOut])
-def list_aptitude_questions(db: Session = Depends(get_db)):
-    return db.query(models.AptitudeQuestion).order_by(models.AptitudeQuestion.created_at.desc()).all()
-
-
-@app.post("/aptitude/questions/{question_id}/answer", response_model=AptitudeAnswerResult)
-def answer_aptitude_question(
-    question_id: int,
-    answer: AptitudeAnswerRequest,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    question = db.query(models.AptitudeQuestion).filter(models.AptitudeQuestion.id == question_id).first()
-    if not question:
-        raise HTTPException(status_code=404, detail="Question not found")
-
-    is_correct = answer.selected_answer.strip() == question.correct_answer.strip()
-
-    personalized_explanation = generate_personalized_explanation(
-        question_text=question.question_text,
-        options=question.options,
-        correct_answer=question.correct_answer,
-        selected_answer=answer.selected_answer,
-        explanation=question.explanation,
-    )
-
-    attempt = models.AptitudeAttempt(
-        user_id=current_user.id,
-        question_id=question.id,
-        selected_answer=answer.selected_answer,
-        is_correct=1 if is_correct else 0,
-        personalized_explanation=personalized_explanation,
-    )
-    db.add(attempt)
-    db.commit()
-
-    return AptitudeAnswerResult(
-        is_correct=is_correct,
-        correct_answer=question.correct_answer,
-        personalized_explanation=personalized_explanation,
-    )
 
 
 @app.get("/eligibility", response_model=List[EligibilityResult])

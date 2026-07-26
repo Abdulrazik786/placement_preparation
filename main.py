@@ -12,7 +12,7 @@ from pypdf import PdfReader
 import models
 from database import engine, get_db
 from auth import hash_password, verify_password, create_access_token, decode_access_token
-from ai_service import analyze_resume, match_resume_to_job, tailor_resume_for_job
+from ai_service import analyze_resume, match_resume_to_job, tailor_resume_for_job, extract_job_requirements
 
 # Folder where uploaded resume files get saved
 UPLOAD_DIR = "uploaded_resumes"
@@ -129,7 +129,7 @@ class JobPostingCreate(BaseModel):
     title: str
     company_name: str
     description: str
-    required_skills: List[str] = []
+    required_skills: Optional[List[str]] = None  # if not given, AI extracts these from the description
 
 
 class JobPostingOut(BaseModel):
@@ -137,7 +137,9 @@ class JobPostingOut(BaseModel):
     title: str
     company_name: str
     description: str
+    role: Optional[str]
     required_skills: List[str]
+    experience_summary: Optional[str]
     created_at: datetime
 
     class Config:
@@ -386,11 +388,20 @@ def analyze_my_resume(
 
 @app.post("/jobs", response_model=JobPostingOut)
 def create_job(job: JobPostingCreate, db: Session = Depends(get_db)):
+    # Always run extraction to get "role" and "experience_summary"; only use the AI's
+    # required_skills if the caller didn't provide their own list explicitly.
+    try:
+        extracted = extract_job_requirements(job.description)
+    except ValueError:
+        extracted = {"role": None, "required_skills": [], "experience_summary": None}
+
     new_job = models.JobPosting(
         title=job.title,
         company_name=job.company_name,
         description=job.description,
-        required_skills=job.required_skills,
+        role=extracted.get("role"),
+        required_skills=job.required_skills if job.required_skills is not None else extracted.get("required_skills", []),
+        experience_summary=extracted.get("experience_summary"),
     )
     db.add(new_job)
     db.commit()

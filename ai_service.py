@@ -79,6 +79,42 @@ Original resume text:
 """
 
 
+JD_EXTRACTION_PROMPT = """Extract structured information from this job description.
+
+Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
+{{
+  "role": "<normalized job title/role, e.g. 'Machine Learning Engineer'>",
+  "required_skills": [<list of specific technical skills/tools/technologies mentioned or clearly implied, e.g. 'Python', 'Docker', 'AWS'>],
+  "experience_summary": "<1 sentence summary of the kind of experience expected, e.g. 'ML model development and deployment'>"
+}}
+
+Job description:
+---
+{description}
+---
+"""
+
+
+def extract_job_requirements(description: str) -> dict:
+    if not description or not description.strip():
+        raise ValueError("Job description is empty, cannot extract requirements")
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=JD_EXTRACTION_PROMPT.format(description=description[:4000]),
+    )
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
+
+
 def tailor_resume_for_job(resume_text: str, job_description: str) -> dict:
     if not resume_text or not resume_text.strip():
         raise ValueError("Resume text is empty, cannot tailor")

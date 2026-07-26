@@ -71,8 +71,10 @@ class JobPosting(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, nullable=False)          # e.g. "Software Engineer Intern"
     company_name = Column(String, nullable=False)
-    description = Column(String, nullable=False)     # full job description text
-    required_skills = Column(JSON, default=list)      # e.g. ["Python", "SQL", "REST APIs"]
+    description = Column(String, nullable=False)     # full job description text, as pasted
+    role = Column(String, nullable=True)               # AI-extracted normalized role name, e.g. "Machine Learning Engineer"
+    required_skills = Column(JSON, default=list)      # AI-extracted if not provided manually, e.g. ["Python", "SQL"]
+    experience_summary = Column(String, nullable=True)  # AI-extracted, e.g. "ML development, model deployment"
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 

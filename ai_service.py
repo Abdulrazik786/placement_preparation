@@ -95,6 +95,46 @@ Job description:
 """
 
 
+SKILL_PREP_PROMPT = """A college student is preparing for a "{role}" job. They are missing these skills: {skills_list}.
+
+For EACH missing skill, provide prep guidance. Return ONLY a JSON object (no markdown, no preamble, no code fences)
+with this exact shape:
+{{
+  "prep_topics": [
+    {{
+      "skill": "<the skill name, exactly as given>",
+      "why_needed": "<1 sentence on why this skill matters for this specific role>",
+      "key_concepts": [<up to 5 short strings naming core concepts/subtopics to learn>]
+    }}
+  ]
+}}
+
+Include one object per skill listed, in the same order.
+"""
+
+
+def generate_skill_prep_batch(skills: list, role: str) -> list:
+    """Generates prep content for ALL missing skills in a single AI call, to stay within free-tier rate limits."""
+    if not skills:
+        return []
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=SKILL_PREP_PROMPT.format(role=role or "the target role", skills_list=", ".join(skills)),
+    )
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        parsed = json.loads(raw_text)
+        return parsed.get("prep_topics", [])
+    except json.JSONDecodeError:
+        raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
+
+
 def extract_job_requirements(description: str) -> dict:
     if not description or not description.strip():
         raise ValueError("Job description is empty, cannot extract requirements")

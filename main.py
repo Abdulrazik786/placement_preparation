@@ -12,7 +12,13 @@ from pypdf import PdfReader
 import models
 from database import engine, get_db
 from auth import hash_password, verify_password, create_access_token, decode_access_token
-from ai_service import analyze_resume, match_resume_to_job, tailor_resume_for_job, extract_job_requirements
+from ai_service import (
+    analyze_resume,
+    match_resume_to_job,
+    tailor_resume_for_job,
+    extract_job_requirements,
+    generate_skill_prep_batch,
+)
 
 # Folder where uploaded resume files get saved
 UPLOAD_DIR = "uploaded_resumes"
@@ -161,6 +167,20 @@ class TailoredResumeOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class SkillPrepTopic(BaseModel):
+    skill: str
+    why_needed: str
+    key_concepts: List[str]
+
+
+class SkillGapOut(BaseModel):
+    job_title: str
+    role: Optional[str]
+    matching_skills: List[str]
+    missing_skills: List[str]
+    prep_topics: List[SkillPrepTopic]
 
 
 class EligibilityResult(BaseModel):
@@ -508,6 +528,47 @@ def list_my_tailored_resumes(
         )
         for r in results
     ]
+
+
+@app.get("/jobs/{job_id}/skill-gap", response_model=SkillGapOut)
+def get_skill_gap(
+    job_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = db.query(models.JobPosting).filter(models.JobPosting.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job posting not found")
+
+    student_skills_lower = {s.lower().strip() for s in (current_user.skills or [])}
+    required = job.required_skills or []
+
+    matching = [s for s in required if s.lower().strip() in student_skills_lower]
+    missing = [s for s in required if s.lower().strip() not in student_skills_lower]
+
+    prep_topics = []
+    if missing:
+        try:
+            raw_prep_topics = generate_skill_prep_batch(missing, job.role)
+            prep_topics = [
+                SkillPrepTopic(
+                    skill=p.get("skill", ""),
+                    why_needed=p.get("why_needed", ""),
+                    key_concepts=p.get("key_concepts", []),
+                )
+                for p in raw_prep_topics
+            ]
+        except ValueError:
+            # if AI generation fails, return the gap without prep content rather than failing the whole request
+            pass
+
+    return SkillGapOut(
+        job_title=job.title,
+        role=job.role,
+        matching_skills=matching,
+        missing_skills=missing,
+        prep_topics=prep_topics,
+    )
 
 
 @app.get("/eligibility", response_model=List[EligibilityResult])

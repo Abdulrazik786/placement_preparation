@@ -1,7 +1,9 @@
 import os
 import json
+import time
 from dotenv import load_dotenv
 from google import genai
+from google.genai import errors as genai_errors
 
 load_dotenv()  # reads .env and loads GEMINI_API_KEY into the environment
 
@@ -11,6 +13,31 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 # current recommended Flash model is, without us hitting deprecation errors again later.
 # As of writing, this resolves to gemini-3.5-flash.
 MODEL_NAME = "gemini-flash-latest"
+
+
+def _generate_with_retry(contents: str, max_retries: int = 3, initial_delay: float = 5.0):
+    """
+    Wraps the Gemini call with automatic retry-with-backoff for rate limit (429) errors.
+    Free tier allows only 5 requests/minute, so a burst of calls can hit this - instead of
+    crashing with a 500 error, we wait and retry a couple of times before giving up.
+    """
+    delay = initial_delay
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            return client.models.generate_content(model=MODEL_NAME, contents=contents)
+        except genai_errors.ClientError as e:
+            is_rate_limit = getattr(e, "status_code", None) == 429 or "RESOURCE_EXHAUSTED" in str(e)
+            last_error = e
+            if is_rate_limit and attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2  # back off progressively longer each retry (5s, 10s, 20s...)
+                continue
+            raise
+
+    raise ValueError(f"AI service unavailable after {max_retries} retries: {last_error}")
+
 
 ATS_ANALYSIS_PROMPT = """You are an ATS (Applicant Tracking System) resume reviewer for college placement preparation.
 
@@ -113,14 +140,127 @@ Include one object per skill listed, in the same order.
 """
 
 
+NEXT_QUESTION_PROMPT = """You are conducting a mock placement interview for a college student. Ask ONE question at a time,
+mixing HR, technical, resume-based, and project-based questions naturally across the interview. Make each question feel
+like a real interviewer's follow-up - if the candidate's last answer mentioned something specific, dig into it, the way
+a human interviewer would, instead of jumping to an unrelated topic.
+
+Candidate profile:
+Skills: {skills}
+Projects: {projects}
+Career interest: {career_interest}
+
+{job_context}
+
+{resume_context}
+
+Conversation so far (empty if this is the first question):
+{formatted_history}
+
+Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
+{{
+  "question_text": "<the next question>",
+  "question_type": "<one of: hr, technical, resume, project>"
+}}
+
+If the conversation so far is empty, start with an opening question like "Tell me about yourself."
+Ask no more than one question. Keep it concise, like a real interviewer would speak.
+"""
+
+INTERVIEW_EVALUATION_PROMPT = """Evaluate this completed mock placement interview transcript for a college student.
+
+Candidate profile:
+Skills: {skills}
+Career interest: {career_interest}
+
+{job_context}
+
+Full transcript (question and answer pairs):
+{formatted_history}
+
+Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
+{{
+  "overall_score": <integer 0-100>,
+  "technical_score": <integer 0-100>,
+  "resume_score": <integer 0-100>,
+  "project_score": <integer 0-100>,
+  "communication_score": <integer 0-100>,
+  "strong_areas": [<up to 5 short strings>],
+  "needs_preparation": [<up to 5 short strings>],
+  "question_feedback": [
+    {{"question": "<question>", "answer": "<candidate's answer>", "feedback": "<1-2 sentence feedback on this specific answer>"}}
+  ],
+  "summary": "<3-4 sentence overall assessment>"
+}}
+
+Include one question_feedback entry per question asked in the transcript.
+"""
+
+
+def _format_history(history: list) -> str:
+    if not history:
+        return "(none yet - this is the start of the interview)"
+    lines = []
+    for turn in history:
+        lines.append(f"Q ({turn['question_type']}): {turn['question']}")
+        if turn.get("answer"):
+            lines.append(f"A: {turn['answer']}")
+    return "\n".join(lines)
+
+
+def generate_next_interview_question(
+    skills: list, projects: list, career_interest: str, job_context: str, resume_context: str, history: list
+) -> dict:
+    response = _generate_with_retry(
+        NEXT_QUESTION_PROMPT.format(
+            skills=", ".join(skills) if skills else "not specified",
+            projects=json.dumps(projects) if projects else "not specified",
+            career_interest=career_interest or "not specified",
+            job_context=job_context,
+            resume_context=resume_context,
+            formatted_history=_format_history(history),
+    ),
+    )
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
+
+
+def evaluate_interview(skills: list, career_interest: str, job_context: str, history: list) -> dict:
+    response = _generate_with_retry(
+        INTERVIEW_EVALUATION_PROMPT.format(
+            skills=", ".join(skills) if skills else "not specified",
+            career_interest=career_interest or "not specified",
+            job_context=job_context,
+            formatted_history=_format_history(history),
+    ),
+    )
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
+
+
 def generate_skill_prep_batch(skills: list, role: str) -> list:
     """Generates prep content for ALL missing skills in a single AI call, to stay within free-tier rate limits."""
     if not skills:
         return []
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=SKILL_PREP_PROMPT.format(role=role or "the target role", skills_list=", ".join(skills)),
+    response = _generate_with_retry(
+        SKILL_PREP_PROMPT.format(role=role or "the target role", skills_list=", ".join(skills)),
     )
     raw_text = (response.text or "").strip()
     if raw_text.startswith("```"):
@@ -139,9 +279,8 @@ def extract_job_requirements(description: str) -> dict:
     if not description or not description.strip():
         raise ValueError("Job description is empty, cannot extract requirements")
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=JD_EXTRACTION_PROMPT.format(description=description[:4000]),
+    response = _generate_with_retry(
+        JD_EXTRACTION_PROMPT.format(description=description[:4000]),
     )
     raw_text = (response.text or "").strip()
     if raw_text.startswith("```"):
@@ -161,12 +300,11 @@ def tailor_resume_for_job(resume_text: str, job_description: str) -> dict:
     if not job_description or not job_description.strip():
         raise ValueError("Job description is empty, cannot tailor")
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=RESUME_TAILOR_PROMPT.format(
+    response = _generate_with_retry(
+        RESUME_TAILOR_PROMPT.format(
             job_description=job_description[:4000],
             resume_text=resume_text[:8000],
-        ),
+    ),
     )
 
     raw_text = (response.text or "").strip()
@@ -187,12 +325,11 @@ def match_resume_to_job(resume_text: str, job_description: str) -> dict:
     if not job_description or not job_description.strip():
         raise ValueError("Job description is empty, cannot match")
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=JOB_MATCH_PROMPT.format(
+    response = _generate_with_retry(
+        JOB_MATCH_PROMPT.format(
             job_description=job_description[:4000],
             resume_text=resume_text[:8000],
-        ),
+    ),
     )
 
     raw_text = (response.text or "").strip()
@@ -211,10 +348,9 @@ def analyze_resume(resume_text: str) -> dict:
     if not resume_text or not resume_text.strip():
         raise ValueError("Resume text is empty, cannot analyze")
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=ATS_ANALYSIS_PROMPT.format(resume_text=resume_text[:8000]),
-        # truncate to ~8000 chars to keep prompt size reasonable; resumes are short documents anyway
+    # truncate to ~8000 chars to keep prompt size reasonable; resumes are short documents anyway
+    response = _generate_with_retry(
+        ATS_ANALYSIS_PROMPT.format(resume_text=resume_text[:8000]),
     )
 
     raw_text = (response.text or "").strip()

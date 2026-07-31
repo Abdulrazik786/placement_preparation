@@ -92,6 +92,51 @@ class TailoredResume(Base):
     user = relationship("User")
 
 
+class InterviewSession(Base):
+    __tablename__ = "interview_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    job_posting_id = Column(Integer, ForeignKey("job_postings.id"), nullable=True)  # optional target job
+    resume_id = Column(Integer, ForeignKey("resumes.id"), nullable=True)              # optional resume used for context
+    status = Column(String, default="in_progress")  # "in_progress" or "completed"
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User")
+    messages = relationship("InterviewMessage", back_populates="session", order_by="InterviewMessage.id")
+
+
+class InterviewMessage(Base):
+    __tablename__ = "interview_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("interview_sessions.id"), nullable=False)
+    sender = Column(String, nullable=False)          # "interviewer" or "candidate"
+    question_type = Column(String, nullable=True)      # "hr", "technical", "resume", "project" - only set for interviewer messages
+    content = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    session = relationship("InterviewSession", back_populates="messages")
+
+
+class InterviewEvaluation(Base):
+    __tablename__ = "interview_evaluations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("interview_sessions.id"), nullable=False, unique=True)
+    overall_score = Column(Integer, nullable=False)
+    technical_score = Column(Integer, nullable=False)
+    resume_score = Column(Integer, nullable=False)
+    project_score = Column(Integer, nullable=False)
+    communication_score = Column(Integer, nullable=False)
+    strong_areas = Column(JSON, default=list)
+    needs_preparation = Column(JSON, default=list)
+    question_feedback = Column(JSON, default=list)  # list of {question, answer, feedback}
+    summary = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class DailyStudyPlan(Base):
     __tablename__ = "daily_study_plans"
 

@@ -5,6 +5,7 @@ from datetime import datetime
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import func
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 from pypdf import PdfReader
@@ -18,6 +19,8 @@ from ai_service import (
     tailor_resume_for_job,
     extract_job_requirements,
     generate_skill_prep_batch,
+    generate_next_interview_question,
+    evaluate_interview,
 )
 
 # Folder where uploaded resume files get saved
@@ -183,6 +186,64 @@ class SkillGapOut(BaseModel):
     prep_topics: List[SkillPrepTopic]
 
 
+class InterviewStartRequest(BaseModel):
+    job_id: Optional[int] = None
+    resume_id: Optional[int] = None
+
+
+class InterviewQuestionOut(BaseModel):
+    session_id: int
+    question_text: str
+    question_type: str
+    status: str
+
+
+class InterviewAnswerRequest(BaseModel):
+    answer: str
+    end_interview: bool = False  # set True to end the interview instead of getting another question
+
+
+class InterviewMessageOut(BaseModel):
+    sender: str
+    question_type: Optional[str]
+    content: str
+
+    class Config:
+        from_attributes = True
+
+
+class InterviewSessionOut(BaseModel):
+    id: int
+    status: str
+    created_at: datetime
+    completed_at: Optional[datetime]
+    messages: List[InterviewMessageOut]
+
+    class Config:
+        from_attributes = True
+
+
+class InterviewQuestionFeedback(BaseModel):
+    question: str
+    answer: str
+    feedback: str
+
+
+class InterviewEvaluationOut(BaseModel):
+    overall_score: int
+    technical_score: int
+    resume_score: int
+    project_score: int
+    communication_score: int
+    strong_areas: List[str]
+    needs_preparation: List[str]
+    question_feedback: List[InterviewQuestionFeedback]
+    summary: str
+
+    class Config:
+        from_attributes = True
+
+
 class EligibilityResult(BaseModel):
     company: CompanyOut
     eligible: bool
@@ -236,6 +297,38 @@ def extract_text_from_pdf(file_path: str) -> str:
     for page in reader.pages:
         text_parts.append(page.extract_text() or "")
     return "\n".join(text_parts)
+
+
+def build_qa_history(messages: list) -> list:
+    """Pairs up interviewer questions with the candidate's following answer, for feeding back into the AI."""
+    history = []
+    pending = None
+    for m in messages:
+        if m.sender == "interviewer":
+            if pending:
+                history.append(pending)
+            pending = {"question_type": m.question_type, "question": m.content, "answer": None}
+        elif m.sender == "candidate" and pending:
+            pending["answer"] = m.content
+    if pending:
+        history.append(pending)
+    return history
+
+
+def build_job_context(job: Optional[models.JobPosting]) -> str:
+    if not job:
+        return "No specific job selected - conduct a general software/tech placement interview."
+    return (
+        f"Target role: {job.role or job.title} at {job.company_name}\n"
+        f"Job description: {job.description[:1000]}\n"
+        f"Required skills: {', '.join(job.required_skills) if job.required_skills else 'not specified'}"
+    )
+
+
+def build_resume_context(resume: Optional[models.Resume]) -> str:
+    if not resume or not resume.extracted_text:
+        return "No resume provided for this interview."
+    return f"Candidate's resume:\n{resume.extracted_text[:2000]}"
 
 
 # ---- Routes ----
@@ -569,6 +662,261 @@ def get_skill_gap(
         missing_skills=missing,
         prep_topics=prep_topics,
     )
+
+
+@app.post("/interviews/start", response_model=InterviewQuestionOut)
+def start_interview(
+    request: InterviewStartRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = None
+    if request.job_id is not None:
+        job = db.query(models.JobPosting).filter(models.JobPosting.id == request.job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job posting not found")
+
+    resume = None
+    if request.resume_id is not None:
+        resume = (
+            db.query(models.Resume)
+            .filter(models.Resume.id == request.resume_id, models.Resume.user_id == current_user.id)
+            .first()
+        )
+        if not resume:
+            raise HTTPException(status_code=404, detail="Resume not found")
+
+    session = models.InterviewSession(
+        user_id=current_user.id,
+        job_posting_id=job.id if job else None,
+        resume_id=resume.id if resume else None,
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+
+    try:
+        result = generate_next_interview_question(
+            skills=current_user.skills or [],
+            projects=current_user.projects or [],
+            career_interest=current_user.career_interest,
+            job_context=build_job_context(job),
+            resume_context=build_resume_context(resume),
+            history=[],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"AI question generation failed: {str(e)}")
+
+    first_message = models.InterviewMessage(
+        session_id=session.id,
+        sender="interviewer",
+        content=result["question_text"],
+        question_type=result.get("question_type"),
+    )
+    db.add(first_message)
+    db.commit()
+
+    return InterviewQuestionOut(
+        session_id=session.id,
+        question_text=result["question_text"],
+        question_type=result.get("question_type", "hr"),
+        status=session.status,
+    )
+
+
+@app.post("/interviews/{session_id}/respond", response_model=InterviewQuestionOut)
+def respond_to_interview(
+    session_id: int,
+    answer: InterviewAnswerRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    session = (
+        db.query(models.InterviewSession)
+        .filter(models.InterviewSession.id == session_id, models.InterviewSession.user_id == current_user.id)
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+    if session.status == "completed":
+        raise HTTPException(status_code=400, detail="This interview has already ended")
+
+    # Save the candidate's answer
+    candidate_message = models.InterviewMessage(
+        session_id=session.id, sender="candidate", content=answer.answer
+    )
+    db.add(candidate_message)
+    db.commit()
+
+    # Student explicitly chose to end the interview (the "Done" button) - no more questions generated
+    if answer.end_interview:
+        session.status = "completed"
+        session.completed_at = func.now()
+        db.commit()
+        return InterviewQuestionOut(
+            session_id=session.id,
+            question_text="Interview ended. You can now request your evaluation.",
+            question_type="hr",
+            status="completed",
+        )
+
+    job = db.query(models.JobPosting).filter(models.JobPosting.id == session.job_posting_id).first() if session.job_posting_id else None
+    resume = db.query(models.Resume).filter(models.Resume.id == session.resume_id).first() if session.resume_id else None
+
+    all_messages = (
+        db.query(models.InterviewMessage)
+        .filter(models.InterviewMessage.session_id == session.id)
+        .order_by(models.InterviewMessage.id)
+        .all()
+    )
+    history = build_qa_history(all_messages)
+
+    try:
+        result = generate_next_interview_question(
+            skills=current_user.skills or [],
+            projects=current_user.projects or [],
+            career_interest=current_user.career_interest,
+            job_context=build_job_context(job),
+            resume_context=build_resume_context(resume),
+            history=history,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"AI question generation failed: {str(e)}")
+
+    next_message = models.InterviewMessage(
+        session_id=session.id,
+        sender="interviewer",
+        content=result["question_text"],
+        question_type=result.get("question_type"),
+    )
+    db.add(next_message)
+    db.commit()
+
+    return InterviewQuestionOut(
+        session_id=session.id,
+        question_text=result["question_text"],
+        question_type=result.get("question_type", "hr"),
+        status=session.status,
+    )
+
+
+@app.post("/interviews/{session_id}/end", response_model=InterviewSessionOut)
+def end_interview(
+    session_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    session = (
+        db.query(models.InterviewSession)
+        .filter(models.InterviewSession.id == session_id, models.InterviewSession.user_id == current_user.id)
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+
+    if session.status != "completed":
+        session.status = "completed"
+        session.completed_at = func.now()
+        db.commit()
+        db.refresh(session)
+
+    return session
+
+
+@app.get("/interviews", response_model=List[InterviewSessionOut])
+def list_my_interviews(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return (
+        db.query(models.InterviewSession)
+        .filter(models.InterviewSession.user_id == current_user.id)
+        .order_by(models.InterviewSession.created_at.desc())
+        .all()
+    )
+
+
+@app.get("/interviews/{session_id}", response_model=InterviewSessionOut)
+def get_interview_transcript(
+    session_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    session = (
+        db.query(models.InterviewSession)
+        .filter(models.InterviewSession.id == session_id, models.InterviewSession.user_id == current_user.id)
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+    return session
+
+
+@app.post("/interviews/{session_id}/evaluate", response_model=InterviewEvaluationOut)
+def evaluate_my_interview(
+    session_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    session = (
+        db.query(models.InterviewSession)
+        .filter(models.InterviewSession.id == session_id, models.InterviewSession.user_id == current_user.id)
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+
+    existing_eval = (
+        db.query(models.InterviewEvaluation)
+        .filter(models.InterviewEvaluation.session_id == session.id)
+        .first()
+    )
+    if existing_eval:
+        return existing_eval
+
+    job = db.query(models.JobPosting).filter(models.JobPosting.id == session.job_posting_id).first() if session.job_posting_id else None
+
+    all_messages = (
+        db.query(models.InterviewMessage)
+        .filter(models.InterviewMessage.session_id == session.id)
+        .order_by(models.InterviewMessage.id)
+        .all()
+    )
+    history = build_qa_history(all_messages)
+    if not history:
+        raise HTTPException(status_code=400, detail="No interview questions/answers found to evaluate")
+
+    try:
+        result = evaluate_interview(
+            skills=current_user.skills or [],
+            career_interest=current_user.career_interest,
+            job_context=build_job_context(job),
+            history=history,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"AI evaluation failed: {str(e)}")
+
+    new_eval = models.InterviewEvaluation(
+        session_id=session.id,
+        overall_score=result["overall_score"],
+        technical_score=result["technical_score"],
+        resume_score=result["resume_score"],
+        project_score=result["project_score"],
+        communication_score=result["communication_score"],
+        strong_areas=result.get("strong_areas", []),
+        needs_preparation=result.get("needs_preparation", []),
+        question_feedback=result.get("question_feedback", []),
+        summary=result.get("summary", ""),
+    )
+    db.add(new_eval)
+
+    session.status = "completed"
+    if not session.completed_at:
+        session.completed_at = func.now()
+
+    db.commit()
+    db.refresh(new_eval)
+    return new_eval
 
 
 @app.get("/eligibility", response_model=List[EligibilityResult])

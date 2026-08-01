@@ -262,6 +262,39 @@ class GeneratedResumeOut(BaseModel):
         from_attributes = True
 
 
+class ScoreTrendPoint(BaseModel):
+    date: datetime
+    score: int
+
+
+class DashboardOut(BaseModel):
+    # Profile completeness
+    skills_count: int
+    projects_count: int
+    certifications_count: int
+    internships_count: int
+    profile_complete: bool
+
+    # Resume / ATS
+    resumes_uploaded: int
+    latest_ats_score: Optional[int]
+    ats_score_trend: List[ScoreTrendPoint]
+
+    # Resume generation activity
+    generated_resumes_count: int
+    tailored_resumes_count: int
+
+    # Interviews
+    interviews_completed: int
+    interviews_in_progress: int
+    latest_interview_score: Optional[int]
+    interview_score_trend: List[ScoreTrendPoint]
+
+    # Eligibility
+    companies_checked: int
+    companies_eligible: int
+
+
 class EligibilityResult(BaseModel):
     company: CompanyOut
     eligible: bool
@@ -513,6 +546,15 @@ def analyze_my_resume(
         result = analyze_resume(resume.extracted_text)
     except ValueError as e:
         raise HTTPException(status_code=502, detail=f"AI analysis failed: {str(e)}")
+
+    # Save the score so the dashboard can show a trend over time
+    record = models.ResumeAnalysisRecord(
+        user_id=current_user.id,
+        resume_id=resume.id,
+        ats_score=result["ats_score"],
+    )
+    db.add(record)
+    db.commit()
 
     return result
 
@@ -1050,6 +1092,85 @@ def export_tailored_resume(
         raise HTTPException(status_code=404, detail="Tailored resume not found")
 
     return _export_resume_text(resume.tailored_text, format, f"tailored_resume_{resume.id}")
+
+
+@app.get("/dashboard", response_model=DashboardOut)
+def get_dashboard(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    # --- Profile completeness ---
+    skills_count = len(current_user.skills or [])
+    projects_count = len(current_user.projects or [])
+    certifications_count = len(current_user.certifications or [])
+    internships_count = len(current_user.internships or [])
+    profile_complete = skills_count > 0 and projects_count > 0
+
+    # --- Resume / ATS trend ---
+    resumes_uploaded = db.query(models.Resume).filter(models.Resume.user_id == current_user.id).count()
+
+    ats_records = (
+        db.query(models.ResumeAnalysisRecord)
+        .filter(models.ResumeAnalysisRecord.user_id == current_user.id)
+        .order_by(models.ResumeAnalysisRecord.created_at.asc())
+        .all()
+    )
+    ats_score_trend = [ScoreTrendPoint(date=r.created_at, score=r.ats_score) for r in ats_records]
+    latest_ats_score = ats_score_trend[-1].score if ats_score_trend else None
+
+    generated_resumes_count = (
+        db.query(models.GeneratedResume).filter(models.GeneratedResume.user_id == current_user.id).count()
+    )
+    tailored_resumes_count = (
+        db.query(models.TailoredResume).filter(models.TailoredResume.user_id == current_user.id).count()
+    )
+
+    # --- Interviews ---
+    all_sessions = (
+        db.query(models.InterviewSession)
+        .filter(models.InterviewSession.user_id == current_user.id)
+        .all()
+    )
+    interviews_completed = sum(1 for s in all_sessions if s.status == "completed")
+    interviews_in_progress = sum(1 for s in all_sessions if s.status == "in_progress")
+
+    session_ids = [s.id for s in all_sessions]
+    interview_evals = (
+        db.query(models.InterviewEvaluation)
+        .filter(models.InterviewEvaluation.session_id.in_(session_ids))
+        .order_by(models.InterviewEvaluation.created_at.asc())
+        .all()
+        if session_ids
+        else []
+    )
+    interview_score_trend = [
+        ScoreTrendPoint(date=e.created_at, score=e.overall_score) for e in interview_evals
+    ]
+    latest_interview_score = interview_score_trend[-1].score if interview_score_trend else None
+
+    # --- Eligibility ---
+    companies = db.query(models.Company).all()
+    companies_checked = len(companies)
+    companies_eligible = sum(1 for c in companies if check_eligibility(current_user, c).eligible)
+
+    return DashboardOut(
+        skills_count=skills_count,
+        projects_count=projects_count,
+        certifications_count=certifications_count,
+        internships_count=internships_count,
+        profile_complete=profile_complete,
+        resumes_uploaded=resumes_uploaded,
+        latest_ats_score=latest_ats_score,
+        ats_score_trend=ats_score_trend,
+        generated_resumes_count=generated_resumes_count,
+        tailored_resumes_count=tailored_resumes_count,
+        interviews_completed=interviews_completed,
+        interviews_in_progress=interviews_in_progress,
+        latest_interview_score=latest_interview_score,
+        interview_score_trend=interview_score_trend,
+        companies_checked=companies_checked,
+        companies_eligible=companies_eligible,
+    )
 
 
 @app.get("/eligibility", response_model=List[EligibilityResult])

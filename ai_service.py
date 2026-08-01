@@ -254,6 +254,46 @@ def evaluate_interview(skills: list, career_interest: str, job_context: str, his
         raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
 
 
+RESUME_GENERATION_PROMPT = """You are an expert resume writer creating a brand-new ATS-friendly resume for a college student,
+built entirely from their profile data below. Do NOT invent any experience, skills, or achievements not present
+in the profile - only organize, phrase, and present what's genuinely there in the strongest possible way.
+
+Student profile:
+{profile}
+
+Target job (if any):
+{job_context}
+
+Write a complete, well-structured resume in plain text with clear sections: Summary, Skills, Projects, Internships
+(if any), Certifications (if any), Education. Use strong action verbs and quantify achievements only where the
+profile data already implies a number or measurable outcome - don't fabricate metrics.
+
+Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
+{{
+  "resume_text": "<the complete resume as plain text with section headers>"
+}}
+"""
+
+
+def generate_resume_from_profile(profile: dict, job_context: str) -> dict:
+    response = _generate_with_retry(
+        RESUME_GENERATION_PROMPT.format(
+            profile=json.dumps(profile),
+            job_context=job_context or "No specific job selected - write a general software/tech resume.",
+        ),
+    )
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
+
+
 def generate_skill_prep_batch(skills: list, role: str) -> list:
     """Generates prep content for ALL missing skills in a single AI call, to stay within free-tier rate limits."""
     if not skills:

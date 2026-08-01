@@ -2,7 +2,10 @@ import os
 import shutil
 from datetime import datetime
 
+import io
+
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
+from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
@@ -21,7 +24,9 @@ from ai_service import (
     generate_skill_prep_batch,
     generate_next_interview_question,
     evaluate_interview,
+    generate_resume_from_profile,
 )
+from resume_export import build_docx, build_pdf
 
 # Folder where uploaded resume files get saved
 UPLOAD_DIR = "uploaded_resumes"
@@ -239,6 +244,19 @@ class InterviewEvaluationOut(BaseModel):
     needs_preparation: List[str]
     question_feedback: List[InterviewQuestionFeedback]
     summary: str
+
+    class Config:
+        from_attributes = True
+
+
+class GenerateResumeRequest(BaseModel):
+    job_id: Optional[int] = None
+
+
+class GeneratedResumeOut(BaseModel):
+    id: int
+    resume_text: str
+    created_at: datetime
 
     class Config:
         from_attributes = True
@@ -917,6 +935,121 @@ def evaluate_my_interview(
     db.commit()
     db.refresh(new_eval)
     return new_eval
+
+
+@app.post("/resumes/generate", response_model=GeneratedResumeOut)
+def generate_new_resume(
+    request: GenerateResumeRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = None
+    if request.job_id is not None:
+        job = db.query(models.JobPosting).filter(models.JobPosting.id == request.job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job posting not found")
+
+    profile = {
+        "name": current_user.name,
+        "branch": current_user.branch,
+        "graduation_year": current_user.graduation_year,
+        "cgpa": current_user.cgpa,
+        "skills": current_user.skills or [],
+        "projects": current_user.projects or [],
+        "certifications": current_user.certifications or [],
+        "internships": current_user.internships or [],
+        "career_interest": current_user.career_interest,
+    }
+
+    if not profile["skills"] and not profile["projects"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Your profile needs at least some skills or projects before a resume can be generated. Update it via PUT /me/profile first.",
+        )
+
+    try:
+        result = generate_resume_from_profile(profile, build_job_context(job))
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"AI resume generation failed: {str(e)}")
+
+    new_resume = models.GeneratedResume(
+        user_id=current_user.id,
+        job_posting_id=job.id if job else None,
+        resume_text=result["resume_text"],
+    )
+    db.add(new_resume)
+    db.commit()
+    db.refresh(new_resume)
+    return new_resume
+
+
+@app.get("/resumes/generated", response_model=List[GeneratedResumeOut])
+def list_my_generated_resumes(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return (
+        db.query(models.GeneratedResume)
+        .filter(models.GeneratedResume.user_id == current_user.id)
+        .order_by(models.GeneratedResume.created_at.desc())
+        .all()
+    )
+
+
+def _export_resume_text(resume_text: str, export_format: str, filename_base: str) -> StreamingResponse:
+    export_format = export_format.lower()
+    if export_format == "pdf":
+        buffer = build_pdf(resume_text)
+        media_type = "application/pdf"
+        filename = f"{filename_base}.pdf"
+    elif export_format == "docx":
+        buffer = build_docx(resume_text)
+        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        filename = f"{filename_base}.docx"
+    else:
+        raise HTTPException(status_code=400, detail="format must be 'pdf' or 'docx'")
+
+    return StreamingResponse(
+        buffer,
+        media_type=media_type,
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/resumes/generated/{resume_id}/export")
+def export_generated_resume(
+    resume_id: int,
+    format: str = "pdf",
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resume = (
+        db.query(models.GeneratedResume)
+        .filter(models.GeneratedResume.id == resume_id, models.GeneratedResume.user_id == current_user.id)
+        .first()
+    )
+    if not resume:
+        raise HTTPException(status_code=404, detail="Generated resume not found")
+
+    return _export_resume_text(resume.resume_text, format, f"resume_{resume.id}")
+
+
+@app.get("/tailored-resumes/{tailored_id}/export")
+def export_tailored_resume(
+    tailored_id: int,
+    format: str = "pdf",
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resume = (
+        db.query(models.TailoredResume)
+        .filter(models.TailoredResume.id == tailored_id, models.TailoredResume.user_id == current_user.id)
+        .first()
+    )
+    if not resume:
+        raise HTTPException(status_code=404, detail="Tailored resume not found")
+
+    return _export_resume_text(resume.tailored_text, format, f"tailored_resume_{resume.id}")
 
 
 @app.get("/eligibility", response_model=List[EligibilityResult])

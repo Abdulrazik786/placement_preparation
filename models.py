@@ -137,6 +137,18 @@ class InterviewEvaluation(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class GeneratedResume(Base):
+    __tablename__ = "generated_resumes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    job_posting_id = Column(Integer, ForeignKey("job_postings.id"), nullable=True)  # optional target job
+    resume_text = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+
+
 class DailyStudyPlan(Base):
     __tablename__ = "daily_study_plans"
 

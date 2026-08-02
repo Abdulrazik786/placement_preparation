@@ -275,6 +275,101 @@ Return ONLY a JSON object (no markdown, no preamble, no code fences) with this e
 """
 
 
+ROADMAP_PROMPT = """Create a placement preparation roadmap for a college student.
+
+Student profile:
+{profile}
+
+Target job (if any):
+{job_context}
+
+Skills the student is missing for this target (if any): {missing_skills}
+
+Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
+{{
+  "title": "<short roadmap title, e.g. 'ML Engineer Placement Prep - 6 Week Plan'>",
+  "weeks": [
+    {{
+      "week_number": <int starting at 1>,
+      "focus_area": "<short theme for the week, e.g. 'DSA Fundamentals' or 'Docker & Deployment'>",
+      "tasks": [<3-5 short, concrete task strings for that week>]
+    }}
+  ]
+}}
+
+Create 4-6 weeks. Prioritize the student's missing skills early, and build toward mock interview readiness
+and resume/aptitude polish in later weeks. Be concrete and realistic for a student with limited daily study time.
+"""
+
+DAILY_PLAN_PROMPT = """Create TODAY's study plan for a college student preparing for placements, adjusted based on
+their recent performance.
+
+Student profile:
+{profile}
+
+Current roadmap context (if any): {roadmap_context}
+
+Recent performance signals:
+{performance_summary}
+
+Yesterday's plan and what they completed (if available):
+{yesterday_summary}
+
+Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
+{{
+  "tasks": [
+    {{"title": "<short task title>", "task_type": "<one of: aptitude, coding, resume, interview, learning, other>", "duration_mins": <int>}}
+  ],
+  "performance_note": "<1-2 sentence note explaining how today's plan was adjusted based on recent performance, written directly to the student, encouraging tone>"
+}}
+
+Include 3-6 tasks. If performance signals show a weak area (e.g. low interview score, incomplete tasks yesterday),
+adjust today's plan to reinforce that area rather than just repeating the roadmap verbatim. If yesterday's tasks
+were mostly completed and scores are trending up, slightly increase difficulty or introduce a new topic.
+"""
+
+
+def generate_roadmap(profile: dict, job_context: str, missing_skills: list) -> dict:
+    response = _generate_with_retry(
+        ROADMAP_PROMPT.format(
+            profile=json.dumps(profile),
+            job_context=job_context or "No specific job selected - general software/tech placement prep.",
+            missing_skills=", ".join(missing_skills) if missing_skills else "none identified",
+        ),
+    )
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
+
+
+def generate_daily_plan(profile: dict, roadmap_context: str, performance_summary: str, yesterday_summary: str) -> dict:
+    response = _generate_with_retry(
+        DAILY_PLAN_PROMPT.format(
+            profile=json.dumps(profile),
+            roadmap_context=roadmap_context or "No roadmap generated yet - use general placement prep priorities.",
+            performance_summary=performance_summary or "No performance history yet.",
+            yesterday_summary=yesterday_summary or "No previous day's plan available.",
+        ),
+    )
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
+
+
 def generate_resume_from_profile(profile: dict, job_context: str) -> dict:
     response = _generate_with_retry(
         RESUME_GENERATION_PROMPT.format(

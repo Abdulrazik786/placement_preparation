@@ -1,6 +1,6 @@
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import io
 
@@ -25,6 +25,8 @@ from ai_service import (
     generate_next_interview_question,
     evaluate_interview,
     generate_resume_from_profile,
+    generate_roadmap,
+    generate_daily_plan,
 )
 from resume_export import build_docx, build_pdf
 
@@ -293,6 +295,47 @@ class DashboardOut(BaseModel):
     # Eligibility
     companies_checked: int
     companies_eligible: int
+
+
+class RoadmapGenerateRequest(BaseModel):
+    job_id: Optional[int] = None
+
+
+class RoadmapWeek(BaseModel):
+    week_number: int
+    focus_area: str
+    tasks: List[str]
+
+
+class RoadmapOut(BaseModel):
+    id: int
+    title: str
+    weeks: List[RoadmapWeek]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class DailyTask(BaseModel):
+    title: str
+    task_type: str
+    duration_mins: int
+    done: bool = False
+
+
+class DailyPlanOut(BaseModel):
+    id: int
+    date: datetime
+    tasks: List[DailyTask]
+    performance_note: Optional[str]
+
+    class Config:
+        from_attributes = True
+
+
+class CompleteTasksRequest(BaseModel):
+    completed_task_indices: List[int]  # indices into the tasks list that the student marked done
 
 
 class EligibilityResult(BaseModel):
@@ -1170,6 +1213,204 @@ def get_dashboard(
         interview_score_trend=interview_score_trend,
         companies_checked=companies_checked,
         companies_eligible=companies_eligible,
+    )
+
+
+@app.post("/roadmap/generate", response_model=RoadmapOut)
+def generate_my_roadmap(
+    request: RoadmapGenerateRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = None
+    missing_skills = []
+    if request.job_id is not None:
+        job = db.query(models.JobPosting).filter(models.JobPosting.id == request.job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job posting not found")
+        student_skills_lower = {s.lower().strip() for s in (current_user.skills or [])}
+        missing_skills = [s for s in (job.required_skills or []) if s.lower().strip() not in student_skills_lower]
+
+    profile = {
+        "skills": current_user.skills or [],
+        "projects": current_user.projects or [],
+        "career_interest": current_user.career_interest,
+        "branch": current_user.branch,
+    }
+
+    try:
+        result = generate_roadmap(profile, build_job_context(job), missing_skills)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"AI roadmap generation failed: {str(e)}")
+
+    new_roadmap = models.Roadmap(
+        user_id=current_user.id,
+        job_posting_id=job.id if job else None,
+        title=result["title"],
+        weeks=result["weeks"],
+    )
+    db.add(new_roadmap)
+    db.commit()
+    db.refresh(new_roadmap)
+    return new_roadmap
+
+
+@app.get("/roadmap", response_model=RoadmapOut)
+def get_my_latest_roadmap(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    roadmap = (
+        db.query(models.Roadmap)
+        .filter(models.Roadmap.user_id == current_user.id)
+        .order_by(models.Roadmap.created_at.desc())
+        .first()
+    )
+    if not roadmap:
+        raise HTTPException(status_code=404, detail="No roadmap generated yet. Call POST /roadmap/generate first.")
+    return roadmap
+
+
+@app.post("/daily-plan/today", response_model=DailyPlanOut)
+def get_or_generate_today_plan(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    today = datetime.utcnow().date()
+
+    # If today's plan already exists, just return it instead of generating a new one
+    existing = (
+        db.query(models.DailyStudyPlan)
+        .filter(
+            models.DailyStudyPlan.user_id == current_user.id,
+            func.date(models.DailyStudyPlan.date) == str(today),
+        )
+        .first()
+    )
+    if existing:
+        return existing
+
+    # --- Gather recent performance signals ---
+    latest_ats = (
+        db.query(models.ResumeAnalysisRecord)
+        .filter(models.ResumeAnalysisRecord.user_id == current_user.id)
+        .order_by(models.ResumeAnalysisRecord.created_at.desc())
+        .first()
+    )
+    user_sessions = db.query(models.InterviewSession).filter(models.InterviewSession.user_id == current_user.id).all()
+    session_ids = [s.id for s in user_sessions]
+    latest_interview_eval = (
+        db.query(models.InterviewEvaluation)
+        .filter(models.InterviewEvaluation.session_id.in_(session_ids))
+        .order_by(models.InterviewEvaluation.created_at.desc())
+        .first()
+        if session_ids
+        else None
+    )
+
+    performance_parts = []
+    if latest_ats:
+        performance_parts.append(f"Latest resume ATS score: {latest_ats.ats_score}/100")
+    if latest_interview_eval:
+        performance_parts.append(
+            f"Latest mock interview - overall: {latest_interview_eval.overall_score}, "
+            f"technical: {latest_interview_eval.technical_score}, "
+            f"needs preparation in: {', '.join(latest_interview_eval.needs_preparation or []) or 'none noted'}"
+        )
+    performance_summary = "\n".join(performance_parts) if performance_parts else None
+
+    # --- Yesterday's plan and completion ---
+    yesterday = today - timedelta(days=1)
+    yesterday_plan = (
+        db.query(models.DailyStudyPlan)
+        .filter(
+            models.DailyStudyPlan.user_id == current_user.id,
+            func.date(models.DailyStudyPlan.date) == str(yesterday),
+        )
+        .first()
+    )
+    yesterday_summary = None
+    if yesterday_plan:
+        tasks = yesterday_plan.tasks or []
+        done_count = sum(1 for t in tasks if t.get("done"))
+        yesterday_summary = (
+            f"Completed {done_count}/{len(tasks)} tasks: "
+            + "; ".join(f"{t['title']} ({'done' if t.get('done') else 'not done'})" for t in tasks)
+        )
+
+    # --- Latest roadmap, for context ---
+    latest_roadmap = (
+        db.query(models.Roadmap)
+        .filter(models.Roadmap.user_id == current_user.id)
+        .order_by(models.Roadmap.created_at.desc())
+        .first()
+    )
+    roadmap_context = None
+    if latest_roadmap:
+        roadmap_context = f"Roadmap: {latest_roadmap.title}. Weeks: " + "; ".join(
+            f"Week {w['week_number']} - {w['focus_area']}" for w in (latest_roadmap.weeks or [])
+        )
+
+    profile = {
+        "skills": current_user.skills or [],
+        "projects": current_user.projects or [],
+        "career_interest": current_user.career_interest,
+    }
+
+    try:
+        result = generate_daily_plan(profile, roadmap_context, performance_summary, yesterday_summary)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"AI daily plan generation failed: {str(e)}")
+
+    tasks_with_done_flag = [{**t, "done": False} for t in result.get("tasks", [])]
+
+    new_plan = models.DailyStudyPlan(
+        user_id=current_user.id,
+        tasks=tasks_with_done_flag,
+        performance_note=result.get("performance_note"),
+    )
+    db.add(new_plan)
+    db.commit()
+    db.refresh(new_plan)
+    return new_plan
+
+
+@app.put("/daily-plan/{plan_id}/complete", response_model=DailyPlanOut)
+def mark_tasks_complete(
+    plan_id: int,
+    request: CompleteTasksRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    plan = (
+        db.query(models.DailyStudyPlan)
+        .filter(models.DailyStudyPlan.id == plan_id, models.DailyStudyPlan.user_id == current_user.id)
+        .first()
+    )
+    if not plan:
+        raise HTTPException(status_code=404, detail="Daily plan not found")
+
+    tasks = plan.tasks or []
+    for idx in request.completed_task_indices:
+        if 0 <= idx < len(tasks):
+            tasks[idx]["done"] = True
+    plan.tasks = tasks  # reassign so SQLAlchemy detects the JSON column changed
+
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+@app.get("/daily-plan/history", response_model=List[DailyPlanOut])
+def get_daily_plan_history(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return (
+        db.query(models.DailyStudyPlan)
+        .filter(models.DailyStudyPlan.user_id == current_user.id)
+        .order_by(models.DailyStudyPlan.date.desc())
+        .all()
     )
 
 

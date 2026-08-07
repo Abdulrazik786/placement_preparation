@@ -4,7 +4,9 @@ from datetime import datetime, timedelta
 
 import io
 
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
@@ -38,6 +40,26 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Placement Prep API")
+
+# Allows the Next.js frontend (running on a different port) to make requests to this API.
+# Without this, browsers block the requests entirely due to CORS policy.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # your frontend's dev server address
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Allows the frontend (a plain HTML file, opened directly or served separately) to call this API.
+# Wide open for local development - tighten this to specific origins before real deployment.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,  # we use Bearer tokens, not cookies, so credentials mode isn't needed
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Tells FastAPI where clients should send username/password to get a token (used by /docs UI too)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")

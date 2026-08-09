@@ -4,6 +4,7 @@ import time
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors as genai_errors
+import httpx
 
 load_dotenv()  # reads .env and loads GEMINI_API_KEY into the environment
 
@@ -14,12 +15,23 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 # As of writing, this resolves to gemini-3.5-flash.
 MODEL_NAME = "gemini-flash-latest"
 
+# Errors worth retrying: rate limits (429) and transient network issues (dropped connections,
+# timeouts). These are usually momentary - a brief wait and retry resolves them without the
+# user ever seeing an error. Anything else (bad request, auth failure, etc.) is not retried.
+RETRYABLE_NETWORK_ERRORS = (
+    httpx.RemoteProtocolError,
+    httpx.ConnectError,
+    httpx.ReadTimeout,
+    httpx.ConnectTimeout,
+)
+
 
 def _generate_with_retry(contents: str, max_retries: int = 3, initial_delay: float = 5.0):
     """
-    Wraps the Gemini call with automatic retry-with-backoff for rate limit (429) errors.
-    Free tier allows only 5 requests/minute, so a burst of calls can hit this - instead of
-    crashing with a 500 error, we wait and retry a couple of times before giving up.
+    Wraps the Gemini call with automatic retry-with-backoff for rate limit (429) errors and
+    transient network issues (e.g. the connection getting dropped mid-request). Free tier allows
+    only 5 requests/minute, and network hiccups happen occasionally - instead of crashing with a
+    500 error, we wait and retry a couple of times before giving up.
     """
     delay = initial_delay
     last_error = None
@@ -35,6 +47,13 @@ def _generate_with_retry(contents: str, max_retries: int = 3, initial_delay: flo
                 delay *= 2  # back off progressively longer each retry (5s, 10s, 20s...)
                 continue
             raise
+        except RETRYABLE_NETWORK_ERRORS as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise ValueError(f"AI service network error after {max_retries} retries: {last_error}")
 
     raise ValueError(f"AI service unavailable after {max_retries} retries: {last_error}")
 
@@ -120,6 +139,49 @@ Job description:
 {description}
 ---
 """
+
+
+SKILL_MATCH_PROMPT = """A student has these skills: {student_skills}
+
+A job requires these skills: {required_skills}
+
+For each required skill, determine if the student's skills genuinely cover it - accounting for synonyms,
+abbreviations, version numbers, and close variants (e.g. "ML" covers "Machine Learning", "Python" covers
+"Python 3", "JS" covers "JavaScript", "React.js" covers "React"). Do NOT match skills that are only loosely
+related (e.g. "SQL" does NOT cover "MongoDB" - those are different technologies).
+
+Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
+{{
+  "matching_skills": [<required skills, EXACTLY as worded in the input list, that the student's skills cover>],
+  "missing_skills": [<required skills, EXACTLY as worded in the input list, that the student genuinely lacks>]
+}}
+
+Every skill from the required list must appear in exactly one of the two lists.
+"""
+
+
+def match_skills_semantically(student_skills: list, required_skills: list) -> dict:
+    if not required_skills:
+        return {"matching_skills": [], "missing_skills": []}
+    if not student_skills:
+        return {"matching_skills": [], "missing_skills": list(required_skills)}
+
+    response = _generate_with_retry(
+        SKILL_MATCH_PROMPT.format(
+            student_skills=", ".join(student_skills),
+            required_skills=", ".join(required_skills),
+        ),
+    )
+    raw_text = (response.text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise ValueError(f"AI response was not valid JSON: {raw_text[:200]}")
 
 
 SKILL_PREP_PROMPT = """A college student is preparing for a "{role}" job. They are missing these skills: {skills_list}.

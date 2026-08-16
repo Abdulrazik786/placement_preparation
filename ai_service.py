@@ -47,6 +47,15 @@ def _generate_with_retry(contents: str, max_retries: int = 3, initial_delay: flo
                 delay *= 2  # back off progressively longer each retry (5s, 10s, 20s...)
                 continue
             raise
+        except genai_errors.ServerError as e:
+            # 503 UNAVAILABLE etc. - Google's servers are temporarily overloaded, not our bug.
+            # Same backoff treatment as rate limits.
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise ValueError(f"AI service temporarily unavailable after {max_retries} retries: {last_error}")
         except RETRYABLE_NETWORK_ERRORS as e:
             last_error = e
             if attempt < max_retries - 1:
@@ -326,9 +335,25 @@ Student profile:
 Target job (if any):
 {job_context}
 
-Write a complete, well-structured resume in plain text with clear sections: Summary, Skills, Projects, Internships
-(if any), Certifications (if any), Education. Use strong action verbs and quantify achievements only where the
-profile data already implies a number or measurable outcome - don't fabricate metrics.
+Write a complete, well-structured resume in plain text following this EXACT structure:
+
+1. HEADER (first lines): Full name on its own line, then a single line with contact details separated by " | " -
+   include phone, email, LinkedIn URL, and GitHub URL, but ONLY the ones actually present in the profile data.
+   Skip any that are missing - do not write placeholders like "[Add phone]" or "N/A".
+2. SUMMARY: 2-3 sentences.
+3. SKILLS: comma-separated list.
+4. PROJECTS: each with a title line and 1-3 bullet points starting with strong action verbs.
+5. INTERNSHIPS (only if present in profile): each with role/company/duration line and bullet points.
+6. CERTIFICATIONS (only if present in profile): name, issuer, year.
+7. EDUCATION: this section is MANDATORY and must ALWAYS be included, even if some fields are missing - every
+   student has at least a branch/degree in progress. Build it from the "branch", "graduation_year", and "cgpa"
+   profile fields, e.g. "Bachelor of Technology in <expand the branch, e.g. Artificial Intelligence & Machine
+   Learning (AIML)>" followed by "Expected Graduation Year: <year>" and "CGPA: <cgpa>" on separate lines, or
+   whichever of those three fields are actually present in the profile.
+
+Quantify achievements only where the profile data already implies a number or measurable outcome - don't
+fabricate metrics. For INTERNSHIPS and CERTIFICATIONS only (not Education, which is always included): omit the
+section entirely if the student has no data for it, rather than writing "N/A" or "No internships".
 
 Return ONLY a JSON object (no markdown, no preamble, no code fences) with this exact shape:
 {{

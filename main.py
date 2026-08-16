@@ -29,6 +29,7 @@ from ai_service import (
     generate_resume_from_profile,
     generate_roadmap,
     generate_daily_plan,
+    match_skills_semantically,
 )
 from resume_export import build_docx, build_pdf
 
@@ -101,6 +102,12 @@ class ProfileUpdate(BaseModel):
     certifications: Optional[List[CertificationItem]] = None
     internships: Optional[List[InternshipItem]] = None
     career_interest: Optional[str] = None
+    phone: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    github_url: Optional[str] = None
+    branch: Optional[str] = None
+    graduation_year: Optional[int] = None
+    cgpa: Optional[float] = None
 
 
 class UserOut(BaseModel):
@@ -115,6 +122,9 @@ class UserOut(BaseModel):
     certifications: List[dict]
     internships: List[dict]
     career_interest: Optional[str]
+    phone: Optional[str]
+    linkedin_url: Optional[str]
+    github_url: Optional[str]
 
     class Config:
         from_attributes = True
@@ -518,6 +528,18 @@ def update_my_profile(
         current_user.internships = [i.dict() for i in profile.internships]
     if profile.career_interest is not None:
         current_user.career_interest = profile.career_interest
+    if profile.phone is not None:
+        current_user.phone = profile.phone
+    if profile.linkedin_url is not None:
+        current_user.linkedin_url = profile.linkedin_url
+    if profile.github_url is not None:
+        current_user.github_url = profile.github_url
+    if profile.branch is not None:
+        current_user.branch = profile.branch
+    if profile.graduation_year is not None:
+        current_user.graduation_year = profile.graduation_year
+    if profile.cgpa is not None:
+        current_user.cgpa = profile.cgpa
 
     db.commit()
     db.refresh(current_user)
@@ -758,11 +780,17 @@ def get_skill_gap(
     if not job:
         raise HTTPException(status_code=404, detail="Job posting not found")
 
-    student_skills_lower = {s.lower().strip() for s in (current_user.skills or [])}
     required = job.required_skills or []
 
-    matching = [s for s in required if s.lower().strip() in student_skills_lower]
-    missing = [s for s in required if s.lower().strip() not in student_skills_lower]
+    try:
+        match_result = match_skills_semantically(current_user.skills or [], required)
+        matching = match_result.get("matching_skills", [])
+        missing = match_result.get("missing_skills", [])
+    except ValueError:
+        # Fall back to exact matching if the AI call fails, rather than erroring out entirely
+        student_skills_lower = {s.lower().strip() for s in (current_user.skills or [])}
+        matching = [s for s in required if s.lower().strip() in student_skills_lower]
+        missing = [s for s in required if s.lower().strip() not in student_skills_lower]
 
     prep_topics = []
     if missing:
@@ -1058,6 +1086,10 @@ def generate_new_resume(
 
     profile = {
         "name": current_user.name,
+        "email": current_user.email,
+        "phone": current_user.phone,
+        "linkedin_url": current_user.linkedin_url,
+        "github_url": current_user.github_url,
         "branch": current_user.branch,
         "graduation_year": current_user.graduation_year,
         "cgpa": current_user.cgpa,
@@ -1090,6 +1122,10 @@ def generate_new_resume(
     return new_resume
 
 
+class ResumeTextUpdate(BaseModel):
+    resume_text: str
+
+
 @app.get("/resumes/generated", response_model=List[GeneratedResumeOut])
 def list_my_generated_resumes(
     current_user: models.User = Depends(get_current_user),
@@ -1100,6 +1136,53 @@ def list_my_generated_resumes(
         .filter(models.GeneratedResume.user_id == current_user.id)
         .order_by(models.GeneratedResume.created_at.desc())
         .all()
+    )
+
+
+@app.put("/resumes/generated/{resume_id}", response_model=GeneratedResumeOut)
+def update_generated_resume(
+    resume_id: int,
+    update: ResumeTextUpdate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resume = (
+        db.query(models.GeneratedResume)
+        .filter(models.GeneratedResume.id == resume_id, models.GeneratedResume.user_id == current_user.id)
+        .first()
+    )
+    if not resume:
+        raise HTTPException(status_code=404, detail="Generated resume not found")
+
+    resume.resume_text = update.resume_text
+    db.commit()
+    db.refresh(resume)
+    return resume
+
+
+@app.put("/tailored-resumes/{tailored_id}", response_model=TailoredResumeOut)
+def update_tailored_resume(
+    tailored_id: int,
+    update: ResumeTextUpdate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resume = (
+        db.query(models.TailoredResume)
+        .filter(models.TailoredResume.id == tailored_id, models.TailoredResume.user_id == current_user.id)
+        .first()
+    )
+    if not resume:
+        raise HTTPException(status_code=404, detail="Tailored resume not found")
+
+    resume.tailored_text = update.resume_text
+    db.commit()
+    db.refresh(resume)
+    return TailoredResumeOut(
+        id=resume.id,
+        tailored_text=resume.tailored_text,
+        changes_summary=resume.changes_summary,
+        created_at=resume.created_at,
     )
 
 
@@ -1250,8 +1333,14 @@ def generate_my_roadmap(
         job = db.query(models.JobPosting).filter(models.JobPosting.id == request.job_id).first()
         if not job:
             raise HTTPException(status_code=404, detail="Job posting not found")
-        student_skills_lower = {s.lower().strip() for s in (current_user.skills or [])}
-        missing_skills = [s for s in (job.required_skills or []) if s.lower().strip() not in student_skills_lower]
+        try:
+            match_result = match_skills_semantically(current_user.skills or [], job.required_skills or [])
+            missing_skills = match_result.get("missing_skills", [])
+        except ValueError:
+            student_skills_lower = {s.lower().strip() for s in (current_user.skills or [])}
+            missing_skills = [
+                s for s in (job.required_skills or []) if s.lower().strip() not in student_skills_lower
+            ]
 
     profile = {
         "skills": current_user.skills or [],

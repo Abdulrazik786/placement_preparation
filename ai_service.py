@@ -2,67 +2,57 @@ import os
 import json
 import time
 from dotenv import load_dotenv
-from google import genai
-from google.genai import errors as genai_errors
-import httpx
+from groq import Groq
+import groq as groq_sdk
 
-load_dotenv()  # reads .env and loads GEMINI_API_KEY into the environment
+load_dotenv()  # reads .env and loads GROQ_API_KEY into the environment
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# Using the auto-updating "latest" alias so Google can point this at whatever their
-# current recommended Flash model is, without us hitting deprecation errors again later.
-# As of writing, this resolves to gemini-3.5-flash.
-MODEL_NAME = "gemini-flash-latest"
-
-# Errors worth retrying: rate limits (429) and transient network issues (dropped connections,
-# timeouts). These are usually momentary - a brief wait and retry resolves them without the
-# user ever seeing an error. Anything else (bad request, auth failure, etc.) is not retried.
-RETRYABLE_NETWORK_ERRORS = (
-    httpx.RemoteProtocolError,
-    httpx.ConnectError,
-    httpx.ReadTimeout,
-    httpx.ConnectTimeout,
-)
+# Groq deprecated their old Llama chat models - openai/gpt-oss-120b is their current
+# recommended general-purpose model as of writing. Check console.groq.com/docs/models
+# if this ever needs updating.
+MODEL_NAME = "openai/gpt-oss-120b"
 
 
-def _generate_with_retry(contents: str, max_retries: int = 3, initial_delay: float = 5.0):
+def _generate_with_retry(contents: str, max_retries: int = 3, initial_delay: float = 5.0) -> str:
     """
-    Wraps the Gemini call with automatic retry-with-backoff for rate limit (429) errors and
-    transient network issues (e.g. the connection getting dropped mid-request). Free tier allows
-    only 5 requests/minute, and network hiccups happen occasionally - instead of crashing with a
-    500 error, we wait and retry a couple of times before giving up.
+    Wraps the Groq call with automatic retry-with-backoff for rate limit (429) errors and
+    transient network/server issues. Returns the response text directly (not a response object).
     """
     delay = initial_delay
     last_error = None
 
     for attempt in range(max_retries):
         try:
-            return client.models.generate_content(model=MODEL_NAME, contents=contents)
-        except genai_errors.ClientError as e:
-            is_rate_limit = getattr(e, "status_code", None) == 429 or "RESOURCE_EXHAUSTED" in str(e)
-            last_error = e
-            if is_rate_limit and attempt < max_retries - 1:
-                time.sleep(delay)
-                delay *= 2  # back off progressively longer each retry (5s, 10s, 20s...)
-                continue
-            raise
-        except genai_errors.ServerError as e:
-            # 503 UNAVAILABLE etc. - Google's servers are temporarily overloaded, not our bug.
-            # Same backoff treatment as rate limits.
+            completion = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": contents}],
+            )
+            return completion.choices[0].message.content or ""
+        except groq_sdk.RateLimitError as e:
             last_error = e
             if attempt < max_retries - 1:
                 time.sleep(delay)
-                delay *= 2
+                delay *= 2  # back off progressively longer each retry (5s, 10s, 20s...)
                 continue
-            raise ValueError(f"AI service temporarily unavailable after {max_retries} retries: {last_error}")
-        except RETRYABLE_NETWORK_ERRORS as e:
+            raise ValueError(f"AI service rate limit exceeded after {max_retries} retries: {last_error}")
+        except (groq_sdk.APIConnectionError, groq_sdk.APITimeoutError) as e:
+            # transient network issues - dropped connections, timeouts
             last_error = e
             if attempt < max_retries - 1:
                 time.sleep(delay)
                 delay *= 2
                 continue
             raise ValueError(f"AI service network error after {max_retries} retries: {last_error}")
+        except groq_sdk.InternalServerError as e:
+            # Groq's servers temporarily overloaded, not our bug
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise ValueError(f"AI service temporarily unavailable after {max_retries} retries: {last_error}")
 
     raise ValueError(f"AI service unavailable after {max_retries} retries: {last_error}")
 
@@ -181,7 +171,7 @@ def match_skills_semantically(student_skills: list, required_skills: list) -> di
             required_skills=", ".join(required_skills),
         ),
     )
-    raw_text = (response.text or "").strip()
+    raw_text = (response or "").strip()
     if raw_text.startswith("```"):
         raw_text = raw_text.strip("`")
         if raw_text.startswith("json"):
@@ -292,7 +282,7 @@ def generate_next_interview_question(
             formatted_history=_format_history(history),
     ),
     )
-    raw_text = (response.text or "").strip()
+    raw_text = (response or "").strip()
     if raw_text.startswith("```"):
         raw_text = raw_text.strip("`")
         if raw_text.startswith("json"):
@@ -313,7 +303,7 @@ def evaluate_interview(skills: list, career_interest: str, job_context: str, his
             formatted_history=_format_history(history),
     ),
     )
-    raw_text = (response.text or "").strip()
+    raw_text = (response or "").strip()
     if raw_text.startswith("```"):
         raw_text = raw_text.strip("`")
         if raw_text.startswith("json"):
@@ -424,7 +414,7 @@ def generate_roadmap(profile: dict, job_context: str, missing_skills: list) -> d
             missing_skills=", ".join(missing_skills) if missing_skills else "none identified",
         ),
     )
-    raw_text = (response.text or "").strip()
+    raw_text = (response or "").strip()
     if raw_text.startswith("```"):
         raw_text = raw_text.strip("`")
         if raw_text.startswith("json"):
@@ -445,7 +435,7 @@ def generate_daily_plan(profile: dict, roadmap_context: str, performance_summary
             yesterday_summary=yesterday_summary or "No previous day's plan available.",
         ),
     )
-    raw_text = (response.text or "").strip()
+    raw_text = (response or "").strip()
     if raw_text.startswith("```"):
         raw_text = raw_text.strip("`")
         if raw_text.startswith("json"):
@@ -464,7 +454,7 @@ def generate_resume_from_profile(profile: dict, job_context: str) -> dict:
             job_context=job_context or "No specific job selected - write a general software/tech resume.",
         ),
     )
-    raw_text = (response.text or "").strip()
+    raw_text = (response or "").strip()
     if raw_text.startswith("```"):
         raw_text = raw_text.strip("`")
         if raw_text.startswith("json"):
@@ -484,7 +474,7 @@ def generate_skill_prep_batch(skills: list, role: str) -> list:
     response = _generate_with_retry(
         SKILL_PREP_PROMPT.format(role=role or "the target role", skills_list=", ".join(skills)),
     )
-    raw_text = (response.text or "").strip()
+    raw_text = (response or "").strip()
     if raw_text.startswith("```"):
         raw_text = raw_text.strip("`")
         if raw_text.startswith("json"):
@@ -504,7 +494,7 @@ def extract_job_requirements(description: str) -> dict:
     response = _generate_with_retry(
         JD_EXTRACTION_PROMPT.format(description=description[:4000]),
     )
-    raw_text = (response.text or "").strip()
+    raw_text = (response or "").strip()
     if raw_text.startswith("```"):
         raw_text = raw_text.strip("`")
         if raw_text.startswith("json"):
@@ -529,7 +519,7 @@ def tailor_resume_for_job(resume_text: str, job_description: str) -> dict:
     ),
     )
 
-    raw_text = (response.text or "").strip()
+    raw_text = (response or "").strip()
     if raw_text.startswith("```"):
         raw_text = raw_text.strip("`")
         if raw_text.startswith("json"):
@@ -554,7 +544,7 @@ def match_resume_to_job(resume_text: str, job_description: str) -> dict:
     ),
     )
 
-    raw_text = (response.text or "").strip()
+    raw_text = (response or "").strip()
     if raw_text.startswith("```"):
         raw_text = raw_text.strip("`")
         if raw_text.startswith("json"):
@@ -575,7 +565,7 @@ def analyze_resume(resume_text: str) -> dict:
         ATS_ANALYSIS_PROMPT.format(resume_text=resume_text[:8000]),
     )
 
-    raw_text = (response.text or "").strip()
+    raw_text = (response or "").strip()
 
     # Model is instructed to return only JSON, but strip code fences just in case
     if raw_text.startswith("```"):
